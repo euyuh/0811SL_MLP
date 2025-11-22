@@ -1,0 +1,26 @@
+SL_good.py 完成了分割学习部分
+
+SL_quant_store.py 可以运行的加入了伪量化算子和实际部署量化的代码。可以输出量化成整数的参数，
+但是发现了一些问题：1：fakequant没有实际插入前向传播；2：部署时并不是真正的整数，存在float
+
+quant_utils_v1.py 量化部分子函数的初版，与SL_quant_store.py配套运行
+
+SL_MLP_inference_0805.py 目前在编辑的版本。
+
+quant_utils.py 与SL_MLP_inference_0805.py配套的子函数
+
+SL_MLP_quantized.py ——20251029:实现了SL、伪量化算子的插入、量化模型的导出。但是act的统计只存在于子模型最后一层，需要修改。
+
+quant_utils_v2.py——20251029：与上配套的quantize子函数
+
+SL_MLP_1108.py——改进了act实现了act的每层插入，但是输出时发现act的范围、零点、scale都一样
+
+quant_utils_v3.py——与上配套的子函数
+
+SL_MLP_1110.py——修改了EMA的字典名字问题、fold实际调取的内容、更新时的传入参数名，仍缺乏对函数的功能验证
+
+quan_utils_v4——与上配套,函数内置了很多用于验证的print函数。
+
+export_onnx.py——导出浮点onnx文件
+
+client.float.onnx——export_onnx.py产生的文件

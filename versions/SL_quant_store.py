@@ -1,0 +1,689 @@
+# ============================================================================
+import torch
+from torch import nn
+from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+import math
+import os.path
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from PIL import Image
+from glob import glob 
+from pandas import DataFrame
+import random
+import numpy as np
+import os
+import pandas as pd
+# from quantization_0805 import Float4Quantizer
+# from modulation_v2 import Modulator
+from quant_utils import (
+    ActQuantization, DifferentialRound, update_activation_ema,
+    get_activation_range, update_bn_ema, FoldLinear, quan_scheme,
+    quantize_tensor, quantize_activation, quantize_linear_layer, inference_quantized  # 新增导入
+)
+from quant_utils import ACT_EMA
+from quant_utils import export_quantized_model
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import copy
+
+SEED = 1234
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.backends.cudnn.deterministic = True
+    print(torch.cuda.get_device_name(0))    
+
+#===================================================================  
+# program = "SL MLP on MNIST hqam alpha=2  esn0=0"
+program = "SL_MLP_quantized"
+# print(f"---------{program}----------")
+print("starting to train\n")
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
+def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))     
+
+num_users = 1
+epochs =30
+frac = 1
+lr = 0.001
+
+# modem = Modulator(modulation_type='qpsk',ebno_db=8)  # 默认使用HQAM，alpha=0，Eb/N0=10dB
+# modem = Modulator(modulation_type='hqam',alpha=2, ebno_db=-6)  # 默认使用HQAM，alpha=0，Eb/N0=10dB
+
+#=====================================================================================================
+#                           Model Definitions
+#=====================================================================================================
+class MLPClient(nn.Module):
+    def __init__(self):
+        super(MLPClient, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64*64, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Dropout(0.4),
+            nn.Linear(2048, 1024),
+            nn.BatchNorm1d(1024),
+            nn.GELU(),
+            nn.Dropout(0.35),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU()
+        )
+    
+    def forward(self, x, epoch=None, batch_idx=None, user_idx=None):  # 修改函数签名
+        # 获取激活值
+        activation = self.layers(x)
+
+        return activation
+
+class MLPServer(nn.Module):
+    def __init__(self):
+        super(MLPServer, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.35),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Linear(128, 10)
+        )
+    
+    def forward(self, x):
+        return self.layers(x)
+
+net_glob_client = MLPClient()
+if torch.cuda.device_count() > 1:
+    net_glob_client = nn.DataParallel(net_glob_client)
+net_glob_client.to(device)
+
+net_glob_server = MLPServer() 
+if torch.cuda.device_count() > 1:
+    net_glob_server = nn.DataParallel(net_glob_server)
+net_glob_server.to(device)
+
+#===================================================================================
+# Training Utilities
+criterion = nn.CrossEntropyLoss()
+loss_train_collect = []
+acc_train_collect = []
+loss_test_collect = []
+acc_test_collect = []
+batch_acc_train = []
+batch_loss_train = []
+batch_acc_test = []
+batch_loss_test = []
+criterion = nn.CrossEntropyLoss()
+count1 = 0
+count2 = 0
+#====================================================================================================
+#                                  Server Side Functions
+#====================================================================================================
+def calculate_accuracy(fx, y):
+    preds = fx.max(1, keepdim=True)[1]
+    correct = preds.eq(y.view_as(preds)).sum()
+    return 100. * correct.float() / preds.shape[0]
+
+# to print train - test together in each round-- these are made global
+acc_avg_all_user_train = 0
+loss_avg_all_user_train = 0
+loss_train_collect_user = []
+acc_train_collect_user = []
+loss_test_collect_user = []
+acc_test_collect_user = []
+
+
+#client idx collector
+idx_collect = []
+l_epoch_check = False
+fed_check = False
+# Server-side function associated with Training 
+def train_server(noisy_symbols_act, act_shape, 
+                 y, l_epoch_count, l_epoch, idx, len_batch, batch_idx):
+    global net_glob_server, criterion, device, batch_acc_train, batch_loss_train, l_epoch_check, fed_check
+    global loss_train_collect, acc_train_collect, count1, acc_avg_all_user_train, loss_avg_all_user_train, idx_collect
+    global loss_train_collect_user, acc_train_collect_user
+    
+    # # 1. 解调激活值为比特流
+    # demodulated_bit_stream = modem.demodulate(noisy_symbols_act)
+    
+    # # 2. 反量化激活值为float32
+    # fx_client = Float4Quantizer.dequantize(demodulated_bit_stream, act_shape)
+    # fx_client = fx_client.to(device)
+    # 直接接收客户端传来的float32激活值
+    fx_client = noisy_symbols_act.to(device)
+    y = y.to(device)
+     
+    # 需要跟踪激活值的梯度
+    fx_client.requires_grad_(True)
+    
+    net_glob_server.train()
+    optimizer_server = torch.optim.Adam(net_glob_server.parameters(), lr=lr)
+    optimizer_server.zero_grad()
+    
+    # 前向传播
+    fx_server = net_glob_server(fx_client)
+    
+    # === 更新 EMA ===
+    update_bn_ema(net_glob_server)                 # 更新 BN 层统计
+    update_activation_ema(f"server_{idx}_out", fx_server.detach())  # 更新激活范围统计
+
+    # 计算损失和准确率
+    loss = criterion(fx_server, y)
+    acc = calculate_accuracy(fx_server, y)
+    
+    # 反向传播
+    loss.backward()
+    
+    # 获取客户端激活值的梯度
+    dfx_client = fx_client.grad.clone().detach()
+    
+    # 监控梯度
+    # processed_grad = comm_monitor.capture_gradient(dfx_client, l_epoch_count, batch_idx, idx)
+    
+    # 更新服务器模型
+    optimizer_server.step()
+    
+    # # 量化梯度为比特流
+    # quantized_bit_stream = Float4Quantizer.quantize(dfx_client)
+    
+    # # 调制梯度比特流
+    # symbols_grad = modem.modulate(quantized_bit_stream)
+    
+    # # 加噪
+    # noisy_symbols_grad = modem.add_noise(symbols_grad)
+    
+    
+    # 训练状态跟踪
+    batch_loss_train.append(loss.item())
+    batch_acc_train.append(acc.item())
+    count1 += 1
+    
+    # 批次处理逻辑
+    if count1 == len_batch:
+        acc_avg_train = sum(batch_acc_train)/len(batch_acc_train)
+        loss_avg_train = sum(batch_loss_train)/len(batch_loss_train)
+        batch_acc_train, batch_loss_train = [], []
+        count1 = 0
+        
+        prRed(f'Client{idx} Train => Local Epoch: {l_epoch_count} \tAcc: {acc_avg_train:.3f} \tLoss: {loss_avg_train:.4f}')
+        
+        if l_epoch_count == l_epoch-1:
+            l_epoch_check = True
+            loss_train_collect_user.append(loss_avg_train)
+            acc_train_collect_user.append(acc_avg_train)
+            if idx not in idx_collect:
+                idx_collect.append(idx)
+    
+    # 联邦学习轮次检查
+    if len(idx_collect) == num_users and fed_check:
+        fed_check = False
+        acc_avg_all_user_train = sum(acc_train_collect_user)/len(acc_train_collect_user)
+        loss_avg_all_user_train = sum(loss_train_collect_user)/len(loss_train_collect_user)
+        loss_train_collect.append(loss_avg_all_user_train)
+        acc_train_collect.append(acc_avg_all_user_train)
+        acc_train_collect_user, loss_train_collect_user = [], []
+    
+    # 返回调制加噪后的梯度信号
+    # return noisy_symbols_grad
+    # 直接返回梯度张量（float32）
+    return dfx_client.detach()
+
+
+
+
+# Server-side functions associated with Testing
+# ===============================================
+#          evaluate_server 函数 
+# ===============================================
+def evaluate_server(noisy_symbols_act, act_shape, 
+                   y, idx, len_batch, ell, mode='val'):
+    global net_glob_server, criterion, batch_acc_test, batch_loss_test
+    global loss_test_collect, acc_test_collect, count2, num_users, idx_collect
+    global loss_test_collect_user, acc_test_collect_user
+    global fed_check
+    
+    net_glob_server.eval()
+  
+    with torch.no_grad():
+        # # 1. 解调激活值为比特流
+        # demodulated_bit_stream = modem.demodulate(noisy_symbols_act)
+        
+        # # 2. 反量化激活值为float32
+        # fx_client = Float4Quantizer.dequantize(demodulated_bit_stream, act_shape)
+        # fx_client = fx_client.to(device)
+        
+        # 直接接收float32激活值
+        fx_client = noisy_symbols_act.to(device)
+        y = y.to(device) 
+        
+        # 前向传播
+        fx_server = net_glob_server(fx_client)
+        
+        # === 服务器端伪量化 (可选) ===
+        update_activation_ema(f"server_eval_out", fx_server.detach())
+        act_max, act_min = get_activation_range(f"server_eval_out", default_min=-6.0, default_max=6.0)
+        fx_server = ActQuantization(fx_server, FloatMax=act_max, FloatMin=act_min, num_bits=quan_scheme.act_bits)
+        
+        # 计算损失
+        loss = criterion(fx_server, y)
+        # 计算准确率
+        acc = calculate_accuracy(fx_server, y)
+        
+        batch_loss_test.append(loss.item())
+        batch_acc_test.append(acc.item())
+        
+        count2 += 1
+        if count2 == len_batch:
+            acc_avg_test = sum(batch_acc_test)/len(batch_acc_test)
+            loss_avg_test = sum(batch_loss_test)/len(batch_loss_test)
+            
+            batch_acc_test = []
+            batch_loss_test = []
+            count2 = 0
+            
+            # 根据模式显示不同的标签
+            if mode == 'test':
+                prGreen('Client{} [TEST] => \tAcc: {:.3f} \tLoss: {:.4f}'.format(idx, acc_avg_test, loss_avg_test))
+            else:
+                prGreen('Client{} [VAL] => \tAcc: {:.3f} \tLoss: {:.4f}'.format(idx, acc_avg_test, loss_avg_test))
+            
+            # 记录用户测试结果
+            acc_test_collect_user.append(acc_avg_test)
+            loss_test_collect_user.append(loss_avg_test)
+            
+            if idx not in idx_collect:
+                idx_collect.append(idx)
+            
+            # 当所有用户参与后聚合结果
+            if len(idx_collect) == num_users:
+                # 安全处理：检查列表是否为空
+                if acc_test_collect_user:
+                    acc_avg_all_user = sum(acc_test_collect_user)/len(acc_test_collect_user)
+                    loss_avg_all_user = sum(loss_test_collect_user)/len(loss_test_collect_user)
+                else:
+                    acc_avg_all_user = 0.0
+                    loss_avg_all_user = 0.0
+                
+                loss_test_collect.append(loss_avg_all_user)
+                acc_test_collect.append(acc_avg_all_user)
+                
+                # 关键修改：只重置索引收集器，不清空验证结果
+                idx_collect = []  # 重置索引收集器
+                
+                # 仅在测试模式下显示FINAL TEST
+                if mode == 'test':
+                    print("\n====================== FINAL TEST ========================")
+                    print(' Test Round: \tAvg Accuracy {:.3f} | Avg Loss {:.3f}'.format(
+                        acc_avg_all_user, loss_avg_all_user))
+                    print("==========================================================\n")
+         
+    return
+
+
+
+#====================================================================================================
+#                                  Client Side Implementation
+#====================================================================================================
+class DatasetSplit(Dataset):
+    def __init__(self, dataset, idxs):
+        self.dataset = dataset
+        self.idxs = list(idxs)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, item):
+        return self.dataset[self.idxs[item]]
+
+class Client(object):
+    def __init__(self, net_client_model, idx, lr, device, 
+                 dataset_train=None, dataset_val=None, dataset_test=None,
+                 idxs_train=None, idxs_val=None, idxs_test=None):
+        self.idx = idx
+        self.device = device
+        self.lr = lr
+        self.local_ep = 1
+        self.ldr_train = DataLoader(DatasetSplit(dataset_train, idxs_train), 
+                                   batch_size=64, shuffle=True)
+        self.ldr_val = DataLoader(DatasetSplit(dataset_val, idxs_val),
+                                 batch_size=64, shuffle=False)
+        self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test),
+                                  batch_size=64, shuffle=False)
+
+    def train(self, net):
+        net.train()
+        optimizer_client = torch.optim.Adam(net.parameters(), lr=self.lr)
+        
+        for iter in range(self.local_ep):
+            len_batch = len(self.ldr_train)
+            for batch_idx, (images, labels) in enumerate(self.ldr_train):
+                images, labels = images.to(self.device), labels.to(self.device)
+                optimizer_client.zero_grad()
+                
+                # # 前向传播
+                # fx = net(images, epoch=iter, batch_idx=batch_idx, user_idx=self.idx)
+                
+                # # 量化激活值为比特流
+                # quantized_bit_stream = Float4Quantizer.quantize(fx)
+                # client_fx_shape = fx.shape
+                
+                # # 调制比特流
+                # symbols_act = modem.modulate(quantized_bit_stream)
+                
+                # # 加噪
+                # noisy_symbols_act = modem.add_noise(symbols_act)
+                
+                # # 准备梯度计算 (保留原始张量用于反向传播)
+                # client_fx = fx.clone().detach().requires_grad_(True)
+                
+                # # 与服务器通信 (传输调制加噪后的激活值信号)
+                # noisy_symbols_grad = train_server(
+                #     noisy_symbols_act, client_fx_shape,
+                #     labels, iter, self.local_ep, self.idx, len_batch, batch_idx
+                # )
+                
+                # # 在客户端解调梯度信号为比特流
+                # demodulated_bit_stream = modem.demodulate(noisy_symbols_grad)
+                
+                # # 反量化梯度为float32
+                # dfx = Float4Quantizer.dequantize(demodulated_bit_stream, client_fx_shape)
+                
+                # # 反向传播
+                # fx.backward(dfx.to(self.device))
+                # optimizer_client.step()
+                #前向传播
+                fx = net(images, epoch=iter, batch_idx=batch_idx, user_idx=self.idx)
+                # --- Fake quantization and EMA tracking ---
+                update_activation_ema(f"client_{self.idx}_out", fx.detach())
+                act_max, act_min = get_activation_range(f"client_{self.idx}_out", default_min=-6.0, default_max=6.0)
+                fx_q = ActQuantization(fx, FloatMax=act_max, FloatMin=act_min, num_bits=quan_scheme.act_bits)
+
+                # 与服务器直接交换float32数据
+                # dfx = train_server(
+                #     fx.detach(), fx.shape, labels,
+                #     iter, self.local_ep, self.idx, len_batch, batch_idx
+                # )
+                dfx = train_server(
+                    fx_q.detach(), fx_q.shape, labels,
+                    iter, self.local_ep, self.idx, len_batch, batch_idx
+                )
+
+
+                fx.backward(dfx.to(self.device))
+                optimizer_client.step()
+        
+        return net.state_dict()
+
+    def evaluate(self, net, ell, mode='val'):
+        net.eval()
+        loader = self.ldr_test if mode == 'test' else self.ldr_val
+        with torch.no_grad():
+            len_batch = len(loader)
+            for batch_idx, (images, labels) in enumerate(loader):
+                images, labels = images.to(device), labels.to(device)
+                
+                # # 前向传播获取激活值
+                # fx = net(images)
+                # # 量化激活值为比特流
+                # quantized_bit_stream = Float4Quantizer.quantize(fx)
+                # act_shape = fx.shape
+                
+                # # 调制比特流
+                # symbols_act = modem.modulate(quantized_bit_stream)
+                
+                # # 加噪
+                # noisy_symbols_act = modem.add_noise(symbols_act)
+                
+                # # 传递给评估服务器函数（传输调制加噪后的激活值信号）
+                # evaluate_server(
+                #     noisy_symbols_act, act_shape,
+                #     labels, self.idx, len_batch, ell, mode
+                # )
+                fx = net(images)
+
+                # === 添加伪量化 (fake quant) ===
+                update_activation_ema(f"client_{self.idx}_out", fx.detach())
+                act_max, act_min = get_activation_range(f"client_{self.idx}_out", default_min=-6.0, default_max=6.0)
+                fx_q = ActQuantization(fx, FloatMax=act_max, FloatMin=act_min, num_bits=quan_scheme.act_bits)
+
+                # === 把伪量化后的激活传给服务器 ===
+                act_shape = fx_q.shape
+                evaluate_server(fx_q.detach(), act_shape,
+                                labels, self.idx, len_batch, ell, mode)
+                # act_shape = fx.shape
+                # evaluate_server(fx.detach(), act_shape,
+                #                 labels, self.idx, len_batch, ell, mode)
+
+
+#====================================================================================================
+#                             Revised Data Loading Section
+#====================================================================================================
+class SkinData(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, index):
+        img_path = self.df.iloc[index]['path']
+        X = Image.open(img_path).resize((64,64)).convert('L')
+        y = torch.tensor(int(self.df.iloc[index]['target']))
+        if self.transform:
+            X = self.transform(X)
+        return X, y
+
+# 数据集1 (train/val)
+train_csv = '/root/autodl-fs/0811SL_MLP/mnist_train_1.csv'
+train_img_folder = '/root/autodl-fs/0811SL_MLP/train_images'
+df_train_val = pd.read_csv(train_csv)
+df_train_val['path'] = [os.path.join(train_img_folder, f"{i}.png") for i in range(len(df_train_val))]
+df_train_val['target'] = df_train_val['label']
+
+# 数据集2 (test)
+test_csv = '/root/autodl-fs/0811SL_MLP/mnist_test.csv'
+test_img_folder = '/root/autodl-fs/0811SL_MLP/test_images' 
+df_test = pd.read_csv(test_csv)
+df_test['path'] = [os.path.join(test_img_folder, f"{i}.png") for i in range(len(df_test))]
+df_test['target'] = df_test['label']
+
+# 数据预处理
+train_transforms = transforms.Compose([
+    transforms.Resize(64),
+    transforms.CenterCrop(64),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize([0.1307], [0.3081])
+])
+
+test_transforms = transforms.Compose([
+    transforms.Resize(64),
+    transforms.CenterCrop(64),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.1307], [0.3081])
+])
+
+# 数据集划分
+train_df, val_df = train_test_split(df_train_val, test_size=0.2, stratify=df_train_val['target'], random_state=SEED)
+dataset_train = SkinData(train_df, train_transforms)
+dataset_val = SkinData(val_df, test_transforms)
+dataset_test = SkinData(df_test, test_transforms)  # 独立测试集
+
+def dataset_iid(dataset, num_users):
+    
+    num_items = int(len(dataset)/num_users)
+    dict_users, all_idxs = {}, [i for i in range(len(dataset))]
+    for i in range(num_users):
+        dict_users[i] = set(np.random.choice(all_idxs, num_items, replace = False))
+        all_idxs = list(set(all_idxs) - dict_users[i])
+    return dict_users   
+
+
+
+# 数据索引划分
+dict_users_train = dataset_iid(dataset_train, num_users)
+dict_users_val = dataset_iid(dataset_val, num_users)
+dict_users_test = dataset_iid(dataset_test, num_users)
+
+# ===============================================
+#               Main Training Loop
+# ===============================================
+# 初始化最佳模型跟踪
+best_val_loss = float('inf')
+best_epoch = -1
+best_client_state = None
+best_server_state = None
+
+# 保存最佳模型的路径
+best_model_path = '/root/autodl-fs/0811SL_MLP/best model'
+os.makedirs(best_model_path, exist_ok=True)
+
+for epoch in range(epochs):        
+    idxs_users = np.random.choice(range(num_users), max(int(frac*num_users),1), replace=False)
+    
+    for idx in idxs_users:
+        # 初始化客户端
+        client = Client(net_glob_client, idx, lr, device,
+                        dataset_train=dataset_train,
+                        dataset_val=dataset_val,
+                        dataset_test=dataset_test,
+                        idxs_train=dict_users_train[idx],
+                        idxs_val=dict_users_val[idx],
+                        idxs_test=dict_users_test[idx])
+        
+        # 训练
+        w_client = client.train(copy.deepcopy(net_glob_client).to(device))
+        net_glob_client.load_state_dict(w_client)
+        
+        # 验证
+        client.evaluate(copy.deepcopy(net_glob_client).to(device), epoch, mode='val')
+    
+    # 计算当前epoch的平均验证损失
+    if loss_test_collect_user:  # 确保有验证结果
+        current_val_loss = sum(loss_test_collect_user) / len(loss_test_collect_user)
+        
+        # 检查是否是最佳模型
+        if current_val_loss < best_val_loss:
+            best_val_loss = current_val_loss
+            best_epoch = epoch
+            
+            # 在内存中更新最佳模型
+            best_client_state = copy.deepcopy(net_glob_client.state_dict())
+            best_server_state = copy.deepcopy(net_glob_server.state_dict())
+            print(f"Epoch {epoch+1}: Validation loss improved to {best_val_loss:.4f}. Updated best model in memory.")
+        else:
+            print(f"Epoch {epoch+1}: Validation loss did not improve (best: {best_val_loss:.4f})")
+    
+    # 重置验证结果收集器
+    loss_test_collect_user = []
+    acc_test_collect_user = []
+    
+    # 不再每个epoch保存模型到硬盘，只在内存中维护
+
+# ================= 保存最佳模型到硬盘 =================
+print("\n=============== Saving Best Model ===============")
+if best_client_state is not None and best_server_state is not None:
+    torch.save(best_client_state, os.path.join(best_model_path, "client_best.pth"))
+    torch.save(best_server_state, os.path.join(best_model_path, "server_best.pth"))
+    print(f"Saved best model (from epoch {best_epoch+1}) to disk")
+else:
+    print("Warning: No best model found, saving final model")
+    torch.save(net_glob_client.state_dict(), os.path.join(best_model_path, "client_final.pth"))
+    torch.save(net_glob_server.state_dict(), os.path.join(best_model_path, "server_final.pth"))
+
+# ================= 加载最佳模型 =================
+print("\n=============== Loading Best Model ===============")
+if best_client_state is not None and best_server_state is not None:
+    print(f"Loading best model from epoch {best_epoch+1}")
+    net_glob_client.load_state_dict(best_client_state)
+    net_glob_server.load_state_dict(best_server_state)
+else:
+    print("Warning: No best model found, using final model")
+
+# ================= 使用最佳模型进行最终测试 =================
+print("\n=============== Testing Best Model ===============")
+idx_collect = []
+fed_check = True
+# 对每个客户端进行测试
+for idx in range(num_users):
+    client = Client(net_glob_client, idx, lr, device,
+                    dataset_train=dataset_train,
+                    dataset_val=dataset_val,
+                    dataset_test=dataset_test,
+                    idxs_train=dict_users_train[idx],
+                    idxs_val=dict_users_val[idx],
+                    idxs_test=dict_users_test[idx])
+    client.evaluate(copy.deepcopy(net_glob_client).to(device), best_epoch, mode='test')
+
+if acc_test_collect:
+    test_acc_value = acc_test_collect[-1]
+else:
+    print("警告：测试结果未正确收集，使用默认值0")
+    test_acc_value = 0.0
+
+# 创建结果DataFrame
+results_df = pd.DataFrame({
+    'round': range(1, len(acc_train_collect)+1),
+    'train_acc': acc_train_collect,
+    'val_acc': acc_test_collect[:len(acc_train_collect)],
+    'test_acc': [test_acc_value] * len(acc_train_collect)
+})
+
+# 保存结果
+results_df.to_excel(f"{program}_results.xlsx", index=False)
+
+print("训练完成! 结果已保存")
+
+
+# =================== 推理阶段量化验证 ===================
+print("开始进行量化推理模拟...")
+
+# 假设已有 client 变量
+sample_image, sample_label = next(iter(client.ldr_test))# 取一批图像
+sample_image = sample_image.to(device)
+
+
+output = inference_quantized(net_glob_client, net_glob_server, sample_image, ACT_EMA, num_bits=8)
+print("量化推理输出（示例）:", output)
+
+# =================== 导出量化模型参数 ===================
+print("正在执行模型量化导出...")
+
+export_path = export_quantized_model(
+    net_glob_client,     # 客户端模型
+    net_glob_server,     # 服务器模型
+    export_dir="./quantized_export",  # 输出目录
+    num_bits=8           # 量化位宽
+)
+print(f"导出完成，文件保存于: {export_path}")

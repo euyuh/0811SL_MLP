@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+# ==================== EMA Config ====================
+ACT_EMA = {}   # activation range
+BN_EMA = {}    # BN running stats
+EMA_MOMENTUM = 0.99
 # ==================== Quantization Scheme Config ====================
 class QuantizeScheme(object):
     def __init__(self):
@@ -12,10 +16,6 @@ class QuantizeScheme(object):
 
 quan_scheme = QuantizeScheme()
 
-# ==================== EMA Config ====================
-ACT_EMA = {}   # activation range
-BN_EMA = {}    # BN running stats
-EMA_MOMENTUM = 0.99
 
 
 # 放到 quant_utils.py 中合适位置（已使用 BN_EMA, EMA_MOMENTUM 全局）
@@ -78,7 +78,6 @@ class CustomBatchNorm1d(nn.Module):
             # Here we follow your quant_utils: key = f"{prefix}/{name}_bn"
             if self.prefix is not None and self.name_in_module is not None:
                 key = f"{self.prefix}/{self.name_in_module}_bn"
-                print(key)#调试
             else:
                 key = None
 
@@ -98,7 +97,6 @@ class CustomBatchNorm1d(nn.Module):
             # 4) choose stats for normalization:
             if self.use_ema_for_norm and key is not None and key in BN_EMA:
                 # use newly updated EMA (move to device)
-                from quant_utils import BN_EMA
                 mean = BN_EMA[key]['mean'].to(x.device)
                 var  = BN_EMA[key]['var'].to(x.device)
             else:

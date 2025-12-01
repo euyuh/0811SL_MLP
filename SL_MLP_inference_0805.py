@@ -65,19 +65,19 @@ class MLPClient(nn.Module):
             nn.ReLU6(),
             nn.Dropout(0.4),
             FakeQuantLinear(2048, 1024),
-            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.6", use_ema_for_norm=True),
+            CustomBatchNorm1d(1024, prefix="client_layers", name_in_module="layers.6", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.35),
             FakeQuantLinear(1024, 512),
-            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.10", use_ema_for_norm=True),
+            CustomBatchNorm1d(512, prefix="client_layers", name_in_module="layers.10", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.3),
             FakeQuantLinear(512, 256),
-            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.14", use_ema_for_norm=True),
+            CustomBatchNorm1d(256, prefix="client_layers", name_in_module="layers.14", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.25),
             FakeQuantLinear(256, 256),
-            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.18", use_ema_for_norm=True),
+            CustomBatchNorm1d(256, prefix="client_layers", name_in_module="layers.18", use_ema_for_norm=True),
             nn.ReLU6()
         )
     
@@ -90,19 +90,19 @@ class MLPServer(nn.Module):
         super(MLPServer, self).__init__()
         self.layers = nn.Sequential(
             FakeQuantLinear(256, 512),
-            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.1", use_ema_for_norm=True),
+            CustomBatchNorm1d(512, prefix="server_layers", name_in_module="layers.1", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.4),
             FakeQuantLinear(512, 512),
-            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.5", use_ema_for_norm=True),
+            CustomBatchNorm1d(512, prefix="server_layers", name_in_module="layers.5", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.35),
             FakeQuantLinear(512, 256),
-            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.9", use_ema_for_norm=True),
+            CustomBatchNorm1d(256, prefix="server_layers", name_in_module="layers.9", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.3),
             FakeQuantLinear(256, 128),
-            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.13", use_ema_for_norm=True),
+            CustomBatchNorm1d(128, prefix="server_layers", name_in_module="layers.13", use_ema_for_norm=True),
             nn.ReLU6(),
             FakeQuantLinear(128, 10)
         )

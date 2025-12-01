@@ -12,6 +12,116 @@ class QuantizeScheme(object):
 
 quan_scheme = QuantizeScheme()
 
+# ==================== EMA Config ====================
+ACT_EMA = {}   # activation range
+BN_EMA = {}    # BN running stats
+EMA_MOMENTUM = 0.99
+
+
+# 放到 quant_utils.py 中合适位置（已使用 BN_EMA, EMA_MOMENTUM 全局）
+
+
+class CustomBatchNorm1d(nn.Module):
+    """
+    Custom BatchNorm1d that:
+      - 在训练时计算本批次 mean/var，
+      - 立即把本批次统计用 EMA 合并到全局 BN_EMA（按 key）【用于后续的 BN-folding/导出】，
+      - 可选地使用更新后的 EMA 值来进行本次 forward 的归一化（paper-style）。
+    参数:
+      num_features: 通道数
+      eps, momentum: 与 nn.BatchNorm1d 相似的数值稳定项和 running-momentum（用于维护 running_mean/var）
+      prefix: 用于构成 BN_EMA 的 key，比如 "client_layers/layers.3"
+      name_in_module: 层在 module 中的名字（如果能传入更方便）
+      use_ema_for_norm: bool，是否在训练时用 EMA 值做归一化（True -> 符合 paper C.5 顺序）
+    注意:  EMA 更新使用 quant_utils.BN_EMA 全局 dict（与你现有导出/折叠逻辑对齐）
+    """
+    def __init__(self, num_features, eps=1e-5, momentum=0.9, prefix=None, name_in_module=None, use_ema_for_norm=True):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum  # 用于 running_mean/var 的传统更新（可保留）
+        self.prefix = prefix      # e.g. "client_layers"
+        self.name_in_module = name_in_module  # e.g. "layers.3"
+        self.use_ema_for_norm = use_ema_for_norm
+
+        # affine params (gamma, beta)
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        # keep running stats for compatibility (not used directly if use_ema_for_norm True)
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+
+    def forward(self, x):
+        # x: [N, C] or [N, C, ...] (here assume Linear outputs -> [N,C])
+        assert x.dim() >= 2
+        if x.dim() > 2:
+            # collapse spatial dims
+            dims = [0] + list(range(2, x.dim()))
+            B = x.transpose(1, -1).contiguous().view(-1, self.num_features)
+        else:
+            B = x
+
+        if self.training:
+            # 1) compute batch stats
+            batch_mean = B.mean(dim=0)
+            # use unbiased estimator? paper uses population-like (we use B.var(unbiased=False))
+            batch_var = B.var(dim=0, unbiased=False)
+
+            # 2) update running_mean/var (standard BN behavior) (in-place, no grad)
+            with torch.no_grad():
+                self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
+                self.running_var  = self.momentum * self.running_var  + (1 - self.momentum) * batch_var
+
+            # 3) update global BN_EMA (paper: EMA with momentum ~0.99) so FoldLinear can use it later.
+            # construct key consistent with quant_utils.update_bn_ema format
+            # the quant_utils expects keys like f"{prefix}/{name}_bn" or f"{prefix}.{name}_bn" depending on your convention.
+            # Here we follow your quant_utils: key = f"{prefix}/{name}_bn"
+            if self.prefix is not None and self.name_in_module is not None:
+                key = f"{self.prefix}/{self.name_in_module}_bn"
+                print(key)#调试
+            else:
+                key = None
+
+            if key is not None:
+                # BN_EMA is imported from quant_utils (global dict)
+                # Use detach->cpu clone to store CPU copies (consistent with update_bn_ema)
+                # from quant_utils import BN_EMA, EMA_MOMENTUM #感觉不用啊，不都全局了？
+                with torch.no_grad():
+                    cur_mean = batch_mean.detach().cpu().clone()
+                    cur_var = batch_var.detach().cpu().clone()
+                    if key not in BN_EMA:
+                        BN_EMA[key] = {'mean': cur_mean, 'var': cur_var}
+                    else:#为什么这里还需要计算呢？不能直接用刚刚算的running直接读取吗
+                        BN_EMA[key]['mean'] = EMA_MOMENTUM * BN_EMA[key]['mean'] + (1 - EMA_MOMENTUM) * cur_mean
+                        BN_EMA[key]['var']  = EMA_MOMENTUM * BN_EMA[key]['var']  + (1 - EMA_MOMENTUM) * cur_var
+
+            # 4) choose stats for normalization:
+            if self.use_ema_for_norm and key is not None and key in BN_EMA:
+                # use newly updated EMA (move to device)
+                from quant_utils import BN_EMA
+                mean = BN_EMA[key]['mean'].to(x.device)
+                var  = BN_EMA[key]['var'].to(x.device)
+            else:
+                # fall back to batch stats (standard BN behavior)
+                mean = batch_mean.to(x.device)
+                var  = batch_var.to(x.device)
+        else:
+            # eval mode: use running stats
+            mean = self.running_mean.to(x.device)
+            var  = self.running_var.to(x.device)
+
+        # normalize: (x - mean) / sqrt(var + eps) * gamma + beta
+        # reshape to broadcast
+        shape = [1, -1] + [1] * (x.dim() - 2)
+        gamma = self.weight.view(*shape)
+        beta  = self.bias.view(*shape)
+        mean_b = mean.view(*shape)
+        var_b = var.view(*shape)
+
+        x_norm = (x - mean_b) / torch.sqrt(var_b + self.eps)
+        out = x_norm * gamma + beta
+        return out
+
 # ==================== Straight-Through Estimator ====================
 class DifferentialRound(torch.autograd.Function):
     @staticmethod
@@ -43,10 +153,6 @@ def ActQuantization(input, FloatMax=6.0, FloatMin=0.0, num_bits=None):
     return x
 
 # ==================== EMA Trackers ====================
-ACT_EMA = {}   # activation range
-BN_EMA = {}    # BN running stats
-EMA_MOMENTUM = 0.99
-
 def update_activation_ema(name, tensor, momentum=EMA_MOMENTUM):
     batch_min = float(tensor.min().detach().cpu().item())
     batch_max = float(tensor.max().detach().cpu().item())
@@ -352,7 +458,7 @@ def export_quantized_model(client_model, server_model, export_dir="quantized_exp
     def process_sequential(mod: nn.Module, prefix: str = "", num_bits: int = 8):
         """
         遍历模块，导出量化参数（含激活统计），支持：
-        - Linear + BatchNorm1d 折叠
+        - Linear + CustomBatchNorm1d 折叠
         - 嵌套子模块递归
         - 与 register_activation_ema_hooks() 注册的命名一致
         """
@@ -376,7 +482,8 @@ def export_quantized_model(client_model, server_model, export_dir="quantized_exp
                 # 判断下一层是否是BatchNorm1d
                 if idx + 1 < len(next_modules):
                     next_name, next_mod = next_modules[idx + 1]
-                    if isinstance(next_mod, nn.BatchNorm1d):
+                    # if isinstance(next_mod, nn.BatchNorm1d):
+                    if isinstance(next_mod, CustomBatchNorm1d):
                         folded_w, folded_b = FoldLinear(m, next_mod, prefix, next_name)
                         w_q, b_q, w_scale, b_scale, w_zp, b_zp = quantize_linear_layer_from_tensors(
                             folded_w, folded_b, num_bits=num_bits

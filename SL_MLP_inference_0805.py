@@ -19,7 +19,7 @@ from quant_utils import register_activation_ema_hooks
 # from quantization_0805 import Float4Quantizer
 # from modulation_v2 import Modulator
 from quant_utils import (
-    ActQuantization, DifferentialRound, update_activation_ema,
+    CustomBatchNorm1d, ActQuantization, DifferentialRound, update_activation_ema,
     get_activation_range, update_bn_ema, FoldLinear, quan_scheme,
     quantize_tensor, quantize_activation, quantize_linear_layer_from_tensors,
     inference_quantized, export_quantized_model,  FakeQuantLinear, ACT_EMA, BN_EMA
@@ -61,23 +61,23 @@ class MLPClient(nn.Module):
         self.layers = nn.Sequential(
             nn.Flatten(),
             FakeQuantLinear(64*64, 2048),
-            nn.BatchNorm1d(2048),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.2", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.4),
             FakeQuantLinear(2048, 1024),
-            nn.BatchNorm1d(1024),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.6", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.35),
             FakeQuantLinear(1024, 512),
-            nn.BatchNorm1d(512),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.10", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.3),
             FakeQuantLinear(512, 256),
-            nn.BatchNorm1d(256),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.14", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.25),
             FakeQuantLinear(256, 256),
-            nn.BatchNorm1d(256),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.18", use_ema_for_norm=True),
             nn.ReLU6()
         )
     
@@ -90,19 +90,19 @@ class MLPServer(nn.Module):
         super(MLPServer, self).__init__()
         self.layers = nn.Sequential(
             FakeQuantLinear(256, 512),
-            nn.BatchNorm1d(512),
+            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.1", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.4),
             FakeQuantLinear(512, 512),
-            nn.BatchNorm1d(512),
+            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.5", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.35),
             FakeQuantLinear(512, 256),
-            nn.BatchNorm1d(256),
+            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.9", use_ema_for_norm=True),
             nn.ReLU6(),
             nn.Dropout(0.3),
             FakeQuantLinear(256, 128),
-            nn.BatchNorm1d(128),
+            CustomBatchNorm1d(2048, prefix="server_layers", name_in_module="layers.13", use_ema_for_norm=True),
             nn.ReLU6(),
             FakeQuantLinear(128, 10)
         )
@@ -190,7 +190,7 @@ def train_server(noisy_symbols_act, act_shape,
     fx_server = net_glob_server(fx_client)
     
     # === 更新 EMA ===
-    update_bn_ema(net_glob_server, prefix="server_layers")                 # 更新 BN 层统计
+    # update_bn_ema(net_glob_server, prefix="server_layers")                 # 更新 BN 层统计
     # update_activation_ema(f"server_{idx}_out", fx_server.detach())  # 更新激活范围统计 注释掉这行，因为在hook中已经统计
 
     # 计算损失和准确率
@@ -254,7 +254,7 @@ def evaluate_server(noisy_symbols_act, act_shape,
         y = y.to(device) 
         
         fx_server = net_glob_server(fx_client)
-        update_bn_ema(net_glob_server, prefix = "server_layers")
+        # update_bn_ema(net_glob_server, prefix = "server_layers")
         # === 服务器端伪量化 (可选) ===
         # update_activation_ema(f"server_eval_out", fx_server.detach())
         last_server_layer = list(net_glob_server.layers.named_modules())[-1][0]
@@ -350,7 +350,7 @@ class Client(object):
                 fx = net(images, epoch=iter, batch_idx=batch_idx, user_idx=self.idx)
                 
                 # 更新客户端的BN_EMA
-                update_bn_ema(net, prefix="client_layers") 
+                # update_bn_ema(net, prefix="client_layers") 
 
                 last_client_layer = list(net_glob_client.layers.named_modules())[-1][0]
                 act_key_client = f"client_layers/{last_client_layer}_out"
@@ -378,7 +378,7 @@ class Client(object):
             for batch_idx, (images, labels) in enumerate(loader):
                 images, labels = images.to(device), labels.to(device)
                 fx = net(images)
-                update_bn_ema(net, prefix="client_layers")#加了个bnupdate（evaluate要update吗）
+                # update_bn_ema(net, prefix="client_layers")#加了个bnupdate（evaluate要update吗）
                 # update_activation_ema(f"client_{self.idx}_out", fx.detach())
                 last_client_layer = list(net_glob_client.layers.named_modules())[-1][0]
                 act_key_client = f"client_layers/{last_client_layer}_out"

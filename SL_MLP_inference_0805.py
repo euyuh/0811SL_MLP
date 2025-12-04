@@ -431,7 +431,7 @@ train_transforms = transforms.Compose([
     transforms.RandomRotation(10),
     transforms.ToTensor(),
     transforms.Normalize([0.1307], [0.3081])
-])
+])#GPT说randomverticalflip会影响语义，检查一下其他操作会不会，考虑去除。
 
 test_transforms = transforms.Compose([
     transforms.Resize(64),

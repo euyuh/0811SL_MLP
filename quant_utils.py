@@ -222,7 +222,7 @@ def register_activation_ema_hooks(model: torch.nn.Module, prefix: str="model"):
         # 我们通常希望记录以下层的输出（可按需扩展）
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.BatchNorm1d,
                                torch.nn.ReLU, torch.nn.ReLU6, torch.nn.GELU, torch.nn.Sigmoid, torch.nn.Tanh,
-                               torch.nn.Dropout, torch.nn.Flatten)):
+                               torch.nn.Dropout, torch.nn.Flatten, CustomBatchNorm1d)):
             hook_name = f"{prefix}/{name}_out"
             module.register_forward_hook(_activation_hook_factory(hook_name))
 

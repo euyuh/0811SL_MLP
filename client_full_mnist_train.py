@@ -11,7 +11,9 @@ from torch.utils.tensorboard import SummaryWriter
 # Try import quantization helpers from your uploaded file. If you don't want them,
 # you can replace FakeQuantLinear/custom BN with nn.Linear/nn.BatchNorm1d easily.
 try:
-    from quant_utils import FakeQuantLinear, CustomBatchNorm1d
+    from quant_utils import (FakeQuantLinear, CustomBatchNorm1d, 
+                             register_activation_ema_hooks, ACT_EMA, BN_EMA, 
+                             update_bn_ema, export_quantized_model)
     _HAS_QUANT_UTILS = True
 except Exception as e:
     print("Warning: couldn't import FakeQuantLinear / CustomBatchNorm1d from quant_utils.py:", e)
@@ -52,8 +54,11 @@ writer = SummaryWriter(log_dir=log_dir)
 # Data transforms and datasets
 # ----------------------------
 transform = transforms.Compose([
+    transforms.Resize(64),
+    transforms.CenterCrop(64),
+    transforms.Grayscale(num_output_channels=1),
     transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))   # MNIST mean/std
+    transforms.Normalize([0.1307], [0.3081])
 ])
 
 # use existing downloaded data (download=False)
@@ -75,26 +80,32 @@ print(f"Dataset sizes: train={len(train_dataset)}, val={len(val_dataset)}, test=
 # ----------------------------
 # Client model definition
 # ----------------------------
-class ClientModel(nn.Module):#模型变小了点，输入维度变了
+class ClientModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # example MLP-ish client - adapt to your original architecture if needed
-        # input 28x28 -> flatten
         self.layers = nn.Sequential(
             nn.Flatten(),
-            FakeQuantLinear(28*28, 1024),
-            CustomBatchNorm1d(1024, prefix="client_layers", name_in_module="layers.2", use_ema_for_norm=True),
+            FakeQuantLinear(64*64, 2048),
+            CustomBatchNorm1d(2048, prefix="client_layers", name_in_module="layers.2", use_ema_for_norm=True),
             nn.ReLU6(),
-            nn.Dropout(p=0.3),   # tiny dataset调试时建议0.0；训练完整数据可用0.25等
+            nn.Dropout(0.4),
+            FakeQuantLinear(2048, 1024),
+            CustomBatchNorm1d(1024, prefix="client_layers", name_in_module="layers.6", use_ema_for_norm=True),
+            nn.ReLU6(),
+            nn.Dropout(0.35),
             FakeQuantLinear(1024, 512),
-            CustomBatchNorm1d(512, prefix="client_layers", name_in_module="layers.6", use_ema_for_norm=True),
+            CustomBatchNorm1d(512, prefix="client_layers", name_in_module="layers.10", use_ema_for_norm=True),
             nn.ReLU6(),
-            nn.Dropout(p=0.025),
+            nn.Dropout(0.3),
             FakeQuantLinear(512, 256),
-            CustomBatchNorm1d(256, prefix="client_layers", name_in_module="layers.10", use_ema_for_norm=True),
+            CustomBatchNorm1d(256, prefix="client_layers", name_in_module="layers.14", use_ema_for_norm=True),
+            nn.ReLU6(),
+            nn.Dropout(0.25),
+            FakeQuantLinear(256, 256),
+            CustomBatchNorm1d(256, prefix="client_layers", name_in_module="layers.18", use_ema_for_norm=True),
             nn.ReLU6()
         )
-        # temporary classification head on client side
+        # Temporary classification head on client side
         self.classifier = nn.Linear(256, 10)
 
     def forward(self, x, return_features=False):
@@ -104,7 +115,15 @@ class ClientModel(nn.Module):#模型变小了点，输入维度变了
         logits = self.classifier(features)
         return logits
 
+
 net = ClientModel().to(device)
+
+# If using DataParallel, register on .module
+if isinstance(net, torch.nn.DataParallel):
+    register_activation_ema_hooks(net.module, prefix="client_layers")
+else:
+    register_activation_ema_hooks(net, prefix="client_layers")
+
 print(net)
 
 # ----------------------------
@@ -241,3 +260,27 @@ writer.add_scalar("test/acc", test_acc, 0)
 torch.save(net.state_dict(), os.path.join(log_dir, "client_final.pth"))
 writer.close()
 print("All done. TensorBoard logs are in", log_dir)
+
+# run a few batches to populate activation and BN EMAs if not already present
+need_calib = (len(ACT_EMA) == 0) or (len(BN_EMA) == 0)
+if need_calib:
+    print("Running short calibration to fill ACT_EMA / BN_EMA ...")
+    net.train()  # ensure BN layers compute batch stats and update BN_EMA inside CustomBatchNorm1d
+    cal_batches = 20
+    with torch.no_grad():
+        for i, (imgs, _) in enumerate(train_loader):
+            imgs = imgs.to(device)
+            _ = net(imgs)   # forward -> hooks update ACT_EMA, CustomBatchNorm1d updates BN_EMA
+            # Optionally call explicit update_bn_ema if you want to ensure using module running_*
+            update_bn_ema(net, prefix="client_layers")
+            if i + 1 >= cal_batches:
+                break
+    net.eval()
+    print("Calibration done. ACT_EMA keys example:", list(ACT_EMA.keys())[:6])
+    print("BN_EMA keys example:", list(BN_EMA.keys())[:6])
+
+# ---------------- Export quantized params ----------------
+export_dir = "./quantized_export"
+os.makedirs(export_dir, exist_ok=True)
+export_path = export_quantized_model(net, server_model=nn.Sequential(), export_dir=export_dir, num_bits=8)
+print("Exported quantized client model to:", export_path)

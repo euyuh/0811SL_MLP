@@ -4,7 +4,7 @@ from torch.nn import functional as F
 # ==================== EMA Config ====================
 ACT_EMA = {}   # activation range
 BN_EMA = {}    # BN running stats
-EMA_MOMENTUM = 0.99
+EMA_MOMENTUM = 0.9
 # ==================== Quantization Scheme Config ====================
 class QuantizeScheme(object):
     def __init__(self):
@@ -160,7 +160,7 @@ def update_activation_ema(name, tensor, momentum=EMA_MOMENTUM):
         ACT_EMA[name]['min'] = momentum * ACT_EMA[name]['min'] + (1 - momentum) * batch_min
         ACT_EMA[name]['max'] = momentum * ACT_EMA[name]['max'] + (1 - momentum) * batch_max
 
-def get_activation_range(name, default_min=-6.0, default_max=6.0):
+def get_activation_range(name, default_min=0.0, default_max=6.0):
     if name in ACT_EMA:
         return ACT_EMA[name]['max'], ACT_EMA[name]['min']
     else:

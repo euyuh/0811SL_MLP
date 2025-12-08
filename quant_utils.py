@@ -596,6 +596,43 @@ def export_quantized_model(client_model, server_model, export_dir="quantized_exp
     client_layers = {}
     target_client = client_model.layers if hasattr(client_model, "layers") else client_model
     client_layers = process_sequential(target_client, prefix="client_layers/layers")
+    # ==================== 修改开始 ====================
+    # 手动检查并导出 classifier (如果存在于 layers 之外)
+    if hasattr(client_model, 'classifier') and isinstance(client_model.classifier, nn.Linear):
+        print("检测到独立的 classifier 层，正在导出...")
+        m = client_model.classifier
+        
+        # 1. 量化权重和偏置
+        w_q, b_q, w_scale, b_scale, w_zp, b_zp = quantize_linear_layer_from_tensors(
+            m.weight.data,
+            m.bias.data if m.bias is not None else None,
+            num_bits=num_bits
+        )
+        
+        # 2. 构造与推理代码匹配的 Key (client_layers/classifier)
+        key_name = "client_layers/classifier"
+        
+        client_layers[key_name] = {
+            "w_q": w_q.cpu(),
+            "b_q": b_q.cpu() if b_q is not None else None,
+            "w_scale": float(w_scale),
+            "b_scale": float(b_scale) if b_scale is not None else None,
+            "w_zero_point": int(w_zp.item()) if torch.is_tensor(w_zp) else int(w_zp),
+            "b_zero_point": int(b_zp.item()) if torch.is_tensor(b_zp) else int(b_zp),
+            "orig_type": "Linear"
+        }
+        
+        # 3. 尝试导出激活范围 (Key: client_layers/classifier_out)
+        act_key = "client_layers/classifier_out"
+        if act_key in ACT_EMA:
+            act_min = float(ACT_EMA[act_key]['min'])
+            act_max = float(ACT_EMA[act_key]['max'])
+            client_layers[key_name].update({
+                "act_min": act_min,
+                "act_max": act_max
+            })
+            print(f"[Client::{key_name}] Exported manually. w_scale={float(w_scale):.6f}")
+    # ==================== 修改结束 ====================
     for k, v in client_layers.items():
         w_scale = v.get("w_scale", None)
         if w_scale is not None:

@@ -22,9 +22,11 @@ except ImportError:
 # 1. 配置与超参数
 # ==========================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 128
-EPOCHS = 30
-LR = 1e-3
+BATCH_SIZE = 512
+EPOCHS = 50
+LR = 4e-3
+WEIGHT_DECAY = 1e-5
+GRAD_CLIP_NORM = 5.0
 LOG_DIR = "./runs/split_learning_qat"
 DATA_ROOT = "./data"
 VAL_SPLIT = 5000  # 从训练集划出 5000 张做验证
@@ -117,10 +119,10 @@ def train_one_epoch(client_model, server_model, train_loader,
         
         # --- Step 2: Interface Quantization ---
         cut_layer_key = "client/layers.19_out"
-        # [修改] 默认最小值改为 0.0，因为上一层是 ReLU6
+        # 默认最小值改为 0.0，因为上一层是 ReLU6
         act_min, act_max = get_activation_range(cut_layer_key, 0.0, 6.0)
         
-        # 模拟量化传输
+        # 模拟量化传输(其实是输出层伪量化)
         client_out_q = ActQuantization(client_out, FloatMax=act_max, FloatMin=act_min)
         
         # --- Step 3: Send to Server ---
@@ -134,12 +136,21 @@ def train_one_epoch(client_model, server_model, train_loader,
         # --- Step 5: Server Backward ---
         loss.backward()
         
+        # [新增] Server 端梯度裁剪 (在 optimizer.step 之前)
+        if GRAD_CLIP_NORM is not None:
+            torch.nn.utils.clip_grad_norm_(server_model.parameters(), max_norm=GRAD_CLIP_NORM)
+        
         # --- Step 6: Return Gradient ---
         server_grad = server_input.grad.clone()
         
         # --- Step 7: Client Backward ---
         client_out.backward(server_grad)
         
+        # [新增] Client 端梯度裁剪 (在 optimizer.step 之前)
+        if GRAD_CLIP_NORM is not None:
+            torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=GRAD_CLIP_NORM)
+
+        #更新参数    
         opt_server.step()
         opt_client.step()
         
@@ -169,7 +180,7 @@ def evaluate(client_model, server_model, dataloader, criterion):
             
             client_out = client_model(data)
             
-            # [修改] 推理时同样使用 0.0 作为默认最小值
+            # 推理时同样使用 0.0 作为默认最小值
             cut_layer_key = "client_layers/layers.19_out"
             act_min, act_max = get_activation_range(cut_layer_key, 0.0, 6.0)
             client_out = ActQuantization(client_out, FloatMax=act_max, FloatMin=act_min)
@@ -191,7 +202,7 @@ def evaluate(client_model, server_model, dataloader, criterion):
 def main():
     writer = SummaryWriter(log_dir=LOG_DIR)
     
-    # [修改] 数据加载与划分
+    # 数据加载与划分
     transform = transforms.Compose([
         transforms.Resize(64),
         transforms.CenterCrop(64),
@@ -201,8 +212,8 @@ def main():
     ])
     
     # 加载完整训练集和测试集
-    mnist_train_full = datasets.MNIST(DATA_ROOT, train=True, download=True, transform=transform)
-    mnist_test = datasets.MNIST(DATA_ROOT, train=False, transform=transform)
+    mnist_train_full = datasets.MNIST(DATA_ROOT, train=True, download=False, transform=transform)
+    mnist_test = datasets.MNIST(DATA_ROOT, train=False, download=False,transform=transform)
     
     # 划分 Train / Val
     train_len = len(mnist_train_full) - VAL_SPLIT
@@ -221,8 +232,8 @@ def main():
     register_activation_ema_hooks(client_model, prefix="client_layers")
     register_activation_ema_hooks(server_model, prefix="server_layers")
     
-    opt_client = optim.Adam(client_model.parameters(), lr=LR)
-    opt_server = optim.Adam(server_model.parameters(), lr=LR)
+    opt_client = optim.Adam(client_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    opt_server = optim.Adam(server_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt_server, mode='min', factor=0.5, patience=2, verbose=True)
     
@@ -238,7 +249,7 @@ def main():
             opt_client, opt_server, criterion, epoch, writer
         )
         
-        # [修改] 使用 Val 集进行验证
+        # 使用 Val 集进行验证
         val_loss, val_acc = evaluate(client_model, server_model, val_loader, criterion)
         
         print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "

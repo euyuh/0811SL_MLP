@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
-
+from split_comm_utils import BPSKModem, Int8Codec
 # ==========================================
 # 1. 纯整数运算核心 (True Integer Arithmetic)
 # ==========================================
@@ -142,7 +142,6 @@ class ServerInference(nn.Module):
 def main():
     device = torch.device("cpu") # 整数运算通常在 CPU 模拟
     BATCH_SIZE = 128
-    
     transform = transforms.Compose([
         transforms.Resize(64), transforms.CenterCrop(64),
         transforms.Grayscale(1), transforms.ToTensor(),
@@ -171,19 +170,63 @@ def main():
     
     correct = 0
     total = 0
-    
+    modem = BPSKModem(ebno_db=20.0) # 推理时 SNR 可能不同
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
-            
-            # Client Part
+            # 1. Client 推理
             client_output = client_model(images)
             
-            # Transmission (Simulate)
-            transmitted_data = client_output.detach().clone()
+            # --- 自环测试 (Loopback Test) ---
+            # 测试 float_to_bits 和 bits_to_float 是否匹配
+            # 注意：这里的 0.0 和 6.0 必须和你下面正式传输时用的范围一致
+            test_bits, t_scale, t_zp = Int8Codec.float_to_bits(client_output, 0.0, 6.0, 8)
+            rec_output = Int8Codec.bits_to_float(test_bits, t_scale, t_zp, 8)
+
+            # 计算还原误差
+            diff = (client_output - rec_output).abs().max().item()
             
-            # Server Part
-            final_output = server_model(transmitted_data)
+            # 只有当这是第一个 batch 时打印 DEBUG 信息，避免刷屏
+            if total == 0: 
+                print(f"DEBUG: Codec Reconstruction Max Error: {diff:.6f}")
+
+            if diff > 0.5: # 允许一定的量化误差，但如果大于0.5说明逻辑完全错了（比如位序反了）
+                print("!!! 严重警告：编解码逻辑不匹配，比特序可能反了 !!!")
+                print(f"Original (First pixel): {client_output[0,0].item()}")
+                print(f"Reconstructed: {rec_output[0,0].item()}")
+                break # 停止运行以便调试
+            #---测试结束---
+            # 2. 通信过程 (逐步调用)
+            # 定义范围 (ReLU6)
+            val_min, val_max = 0.0, 6.0
+            
+            # Step 1: 量化转比特
+            # 此时 client_output 是模拟 float，我们将其转为 bit stream
+            tx_bits, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+
+            # Step 2: 调制
+            tx_symbols = modem.modulate(tx_bits)
+            
+            # Step 3: 加噪
+            rx_noisy = modem.add_noise(tx_symbols)
+            
+            # Step 4: 解调
+            rx_bits = modem.demodulate(rx_noisy)
+            
+            # Step 5: 反量化
+            # 恢复成浮点数传给 Server (模拟解码后的数据)
+            server_input = Int8Codec.bits_to_float(rx_bits, scale, zp, num_bits=8)
+            
+            # 3. Server 推理
+            final_output = server_model(server_input)
+            # # Client Part
+            # client_output = client_model(images)
+            
+            # # Transmission (Simulate)
+            # transmitted_data = client_output.detach().clone()
+            
+            # # Server Part
+            # final_output = server_model(transmitted_data)
             
             # Stats
             preds = final_output.argmax(dim=1)

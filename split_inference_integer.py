@@ -58,6 +58,12 @@ class IntegerLinear(nn.Module):
         # [关键] 强制转换为 int32 类型，确保后续计算是整数运算
         x_q_int = x_q.int()
         
+        # [插入调试代码 A]
+        if torch.rand(1).item() < 0.01: # 只打印少量次数防止刷屏
+            print(f"\n[Layer DEBUG] Input Scale: {self.in_scale:.6f}, ZP: {self.in_zp}")
+            print(f"[Layer DEBUG] x_float max: {x_float.max().item():.4f}")
+            print(f"[Layer DEBUG] x_q_int max: {x_q_int.max().item()} (Should be > 0)")
+
         # -------------------------------------------------------
         # Step 2: Integer Matrix Multiplication (纯整数运算)
         # -------------------------------------------------------
@@ -68,11 +74,21 @@ class IntegerLinear(nn.Module):
         # 注意：w_q 存储的是 int8，计算时提升为 int32 是硬件标准做法
         w_int = self.w_q.int()
         
+        # [插入调试代码 B] 
+        # 这是最可能的嫌疑人：权重是否为0？
+        if w_int.abs().max().item() == 0:
+            print("!!! CRITICAL ERROR: Weights are all ZERO !!!")
+
         # [关键] 使用 torch.matmul 进行整数矩阵乘法
         # PyTorch 的 F.linear 对 int 输入支持有限，matmul 更通用
         # Input: [Batch, In], Weight.T: [In, Out] -> [Batch, Out]
         acc_int = torch.matmul(x_shifted_int, w_int.t())
         
+        # [插入调试代码 C]
+        # 检查矩阵乘法结果
+        if torch.rand(1).item() < 0.01:
+            print(f"[Layer DEBUG] MatMul Result (acc_int) max: {acc_int.max().item()}")
+            
         # -------------------------------------------------------
         # Step 3: Dequantize (Int32 -> Float)
         # -------------------------------------------------------
@@ -177,25 +193,6 @@ def main():
             # 1. Client 推理
             client_output = client_model(images)
             
-            # --- 自环测试 (Loopback Test) ---
-            # 测试 float_to_bits 和 bits_to_float 是否匹配
-            # 注意：这里的 0.0 和 6.0 必须和你下面正式传输时用的范围一致
-            test_bits, t_scale, t_zp = Int8Codec.float_to_bits(client_output, 0.0, 6.0, 8)
-            rec_output = Int8Codec.bits_to_float(test_bits, t_scale, t_zp, 8)
-
-            # 计算还原误差
-            diff = (client_output - rec_output).abs().max().item()
-            
-            # 只有当这是第一个 batch 时打印 DEBUG 信息，避免刷屏
-            if total == 0: 
-                print(f"DEBUG: Codec Reconstruction Max Error: {diff:.6f}")
-
-            if diff > 0.5: # 允许一定的量化误差，但如果大于0.5说明逻辑完全错了（比如位序反了）
-                print("!!! 严重警告：编解码逻辑不匹配，比特序可能反了 !!!")
-                print(f"Original (First pixel): {client_output[0,0].item()}")
-                print(f"Reconstructed: {rec_output[0,0].item()}")
-                break # 停止运行以便调试
-            #---测试结束---
             # 2. 通信过程 (逐步调用)
             # 定义范围 (ReLU6)
             val_min, val_max = 0.0, 6.0
@@ -206,7 +203,7 @@ def main():
 
             # Step 2: 调制
             tx_symbols = modem.modulate(tx_bits)
-            
+
             # Step 3: 加噪
             rx_noisy = modem.add_noise(tx_symbols)
             

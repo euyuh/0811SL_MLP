@@ -421,7 +421,7 @@ def main():
     # 6. 导出量化参数
     # ==========================================
     print("正在导出量化模型参数...")
-    export_dir = "./quantized_export"
+    export_dir = "./current_export"
     export_quantized_model(client_model, server_model, export_dir=export_dir, num_bits=8)
 
 if __name__ == "__main__":

@@ -57,12 +57,6 @@ class IntegerLinear(nn.Module):
         
         # [关键] 强制转换为 int32 类型，确保后续计算是整数运算
         x_q_int = x_q.int()
-        
-        # [插入调试代码 A]
-        if torch.rand(1).item() < 0.01: # 只打印少量次数防止刷屏
-            print(f"\n[Layer DEBUG] Input Scale: {self.in_scale:.6f}, ZP: {self.in_zp}")
-            print(f"[Layer DEBUG] x_float max: {x_float.max().item():.4f}")
-            print(f"[Layer DEBUG] x_q_int max: {x_q_int.max().item()} (Should be > 0)")
 
         # -------------------------------------------------------
         # Step 2: Integer Matrix Multiplication (纯整数运算)
@@ -74,21 +68,11 @@ class IntegerLinear(nn.Module):
         # 注意：w_q 存储的是 int8，计算时提升为 int32 是硬件标准做法
         w_int = self.w_q.int()
         
-        # [插入调试代码 B] 
-        # 这是最可能的嫌疑人：权重是否为0？
-        if w_int.abs().max().item() == 0:
-            print("!!! CRITICAL ERROR: Weights are all ZERO !!!")
-
         # [关键] 使用 torch.matmul 进行整数矩阵乘法
         # PyTorch 的 F.linear 对 int 输入支持有限，matmul 更通用
         # Input: [Batch, In], Weight.T: [In, Out] -> [Batch, Out]
         acc_int = torch.matmul(x_shifted_int, w_int.t())
-        
-        # [插入调试代码 C]
-        # 检查矩阵乘法结果
-        if torch.rand(1).item() < 0.01:
-            print(f"[Layer DEBUG] MatMul Result (acc_int) max: {acc_int.max().item()}")
-            
+             
         # -------------------------------------------------------
         # Step 3: Dequantize (Int32 -> Float)
         # -------------------------------------------------------
@@ -111,6 +95,44 @@ class ClientInference(nn.Module):
     def __init__(self, client_params):
         super().__init__()
         self.params = client_params
+        # # 辅助函数：从参数字典中提取 input_stats
+        # def get_stats(layer_key, default_min=0.0, default_max=6.0):
+        #     # 尝试查找对应的激活统计值
+        #     # 导出时的 key 可能是 "client_layers/layers.1_folded"
+        #     # 对应的激活 key 通常是 "client_layers/layers.1_folded" (如果是 folded) 或者加 _out
+        #     # 你的导出代码里写的是：layers_quant[f"{full_name}_folded"].update({...})
+        #     # 所以直接读取 layer_params[key] 里的 act_min/act_max 即可
+            
+        #     layer_data = client_params.get(layer_key, {})
+        #     return {
+        #         'act_min': layer_data.get('act_min', default_min),
+        #         'act_max': layer_data.get('act_max', default_max)
+        #     }
+
+        # # 注意：这里我们使用上一层的输出统计作为当前层的输入统计
+        # # 对于第一层，输入是图像，范围是 [-0.5, 3.0] (手动指定)
+        # self.fc1 = IntegerLinear(
+        #     self.params['client_layers/layers.1_folded'], 
+        #     input_stats={'act_min': -0.5, 'act_max': 3.0}
+        # )
+        
+        # # 对于后续层，使用参数中保存的统计值
+        # self.fc2 = IntegerLinear(
+        #     self.params['client_layers/layers.5_folded'], 
+        #     input_stats=get_stats('client_layers/layers.3_out')
+        # )
+        # self.fc3 = IntegerLinear(
+        #     self.params['client_layers/layers.9_folded'], 
+        #     input_stats=get_stats('client_layers/layers.7_out')
+        # )
+        # self.fc4 = IntegerLinear(
+        #     self.params['client_layers/layers.13_folded'], 
+        #     input_stats=get_stats('client_layers/layers.11_out')
+        # )
+        # self.fc5 = IntegerLinear(
+        #     self.params['client_layers/layers.17_folded'], 
+        #     input_stats=get_stats('client_layers/layers.15_out')
+        # )
         self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
 
         self.fc1 = IntegerLinear(self.params['client_layers/layers.1_folded'], 
@@ -136,6 +158,37 @@ class ServerInference(nn.Module):
     def __init__(self, server_params):
         super().__init__()
         self.params = server_params
+        # def get_stats(layer_key, default_min=0.0, default_max=6.0):
+        #     layer_data = server_params.get(layer_key, {})
+        #     return {
+        #         'act_min': layer_data.get('act_min', default_min),
+        #         'act_max': layer_data.get('act_max', default_max)
+        #     }
+
+        # # Server 第一层输入来自 Client，范围是 ReLU6 [0, 6]
+        # # 或者使用通信信道的量化范围
+        # self.fc1 = IntegerLinear(
+        #     self.params['server_layers/layers.0_folded'], 
+        #     input_stats={'act_min': 0.0, 'act_max': 6.0} 
+        # )
+        
+        # self.fc2 = IntegerLinear(
+        #     self.params['server_layers/layers.4_folded'], 
+        #     input_stats=get_stats('server_layers/layers.2_out')
+        # )
+        # self.fc3 = IntegerLinear(
+        #     self.params['server_layers/layers.8_folded'], 
+        #     input_stats=get_stats('server_layers/layers.6_out')
+        # )
+        # self.fc4 = IntegerLinear(
+        #     self.params['server_layers/layers.12_folded'], 
+        #     input_stats=get_stats('server_layers/layers.10_out')
+        # )
+        # # 最后一层通常没有 ReLU，stats 可能不同
+        # self.fc5 = IntegerLinear(
+        #     self.params['server_layers/layers.15'], 
+        #     input_stats=get_stats('server_layers/layers.14_out', default_min=-10.0, default_max=10.0)
+        # )
         self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
 
         self.fc1 = IntegerLinear(self.params['server_layers/layers.0_folded'], input_stats=self.RELU_STATS)
@@ -166,7 +219,7 @@ def main():
     test_ds = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
     
-    export_file = "./quantized_export/split_model_quantized_8bit.pt"
+    export_file = "./current_export/split_model_quantized_8bit.pt"
     if not os.path.exists(export_file):
         print("错误：找不到量化参数文件。")
         return
@@ -192,7 +245,7 @@ def main():
             images, labels = images.to(device), labels.to(device)
             # 1. Client 推理
             client_output = client_model(images)
-            
+           
             # 2. 通信过程 (逐步调用)
             # 定义范围 (ReLU6)
             val_min, val_max = 0.0, 6.0
@@ -213,7 +266,7 @@ def main():
             # Step 5: 反量化
             # 恢复成浮点数传给 Server (模拟解码后的数据)
             server_input = Int8Codec.bits_to_float(rx_bits, scale, zp, num_bits=8)
-            
+
             # 3. Server 推理
             final_output = server_model(server_input)
             # # Client Part

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
-from split_comm_utils import BPSKModem, Int8Codec
+from split_comm_utils import BPSKModem, Int8Codec, Float32Codec
 # ==========================================
 # 1. 纯整数运算核心 (True Integer Arithmetic)
 # ==========================================
@@ -95,52 +95,52 @@ class ClientInference(nn.Module):
     def __init__(self, client_params):
         super().__init__()
         self.params = client_params
-        # # 辅助函数：从参数字典中提取 input_stats
-        # def get_stats(layer_key, default_min=0.0, default_max=6.0):
-        #     # 尝试查找对应的激活统计值
-        #     # 导出时的 key 可能是 "client_layers/layers.1_folded"
-        #     # 对应的激活 key 通常是 "client_layers/layers.1_folded" (如果是 folded) 或者加 _out
-        #     # 你的导出代码里写的是：layers_quant[f"{full_name}_folded"].update({...})
-        #     # 所以直接读取 layer_params[key] 里的 act_min/act_max 即可
+        # 辅助函数：从参数字典中提取 input_stats
+        def get_stats(layer_key, default_min=0.0, default_max=6.0):
+            # 尝试查找对应的激活统计值
+            # 导出时的 key 可能是 "client_layers/layers.1_folded"
+            # 对应的激活 key 通常是 "client_layers/layers.1_folded" (如果是 folded) 或者加 _out
+            # 你的导出代码里写的是：layers_quant[f"{full_name}_folded"].update({...})
+            # 所以直接读取 layer_params[key] 里的 act_min/act_max 即可
             
-        #     layer_data = client_params.get(layer_key, {})
-        #     return {
-        #         'act_min': layer_data.get('act_min', default_min),
-        #         'act_max': layer_data.get('act_max', default_max)
-        #     }
+            layer_data = client_params.get(layer_key, {})
+            return {
+                'act_min': layer_data.get('act_min', default_min),
+                'act_max': layer_data.get('act_max', default_max)
+            }
 
-        # # 注意：这里我们使用上一层的输出统计作为当前层的输入统计
-        # # 对于第一层，输入是图像，范围是 [-0.5, 3.0] (手动指定)
-        # self.fc1 = IntegerLinear(
-        #     self.params['client_layers/layers.1_folded'], 
-        #     input_stats={'act_min': -0.5, 'act_max': 3.0}
-        # )
+        # 注意：这里我们使用上一层的输出统计作为当前层的输入统计
+        # 对于第一层，输入是图像，范围是 [-0.5, 3.0] (手动指定)
+        self.fc1 = IntegerLinear(
+            self.params['client_layers/layers.1_folded'], 
+            input_stats={'act_min': -0.5, 'act_max': 3.0}
+        )
         
-        # # 对于后续层，使用参数中保存的统计值
-        # self.fc2 = IntegerLinear(
-        #     self.params['client_layers/layers.5_folded'], 
-        #     input_stats=get_stats('client_layers/layers.3_out')
-        # )
-        # self.fc3 = IntegerLinear(
-        #     self.params['client_layers/layers.9_folded'], 
-        #     input_stats=get_stats('client_layers/layers.7_out')
-        # )
-        # self.fc4 = IntegerLinear(
-        #     self.params['client_layers/layers.13_folded'], 
-        #     input_stats=get_stats('client_layers/layers.11_out')
-        # )
-        # self.fc5 = IntegerLinear(
-        #     self.params['client_layers/layers.17_folded'], 
-        #     input_stats=get_stats('client_layers/layers.15_out')
-        # )
-        self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
+        # 对于后续层，使用参数中保存的统计值
+        self.fc2 = IntegerLinear(
+            self.params['client_layers/layers.5_folded'], 
+            input_stats=get_stats('client_layers/layers.3_out')
+        )
+        self.fc3 = IntegerLinear(
+            self.params['client_layers/layers.9_folded'], 
+            input_stats=get_stats('client_layers/layers.7_out')
+        )
+        self.fc4 = IntegerLinear(
+            self.params['client_layers/layers.13_folded'], 
+            input_stats=get_stats('client_layers/layers.11_out')
+        )
+        self.fc5 = IntegerLinear(
+            self.params['client_layers/layers.17_folded'], 
+            input_stats=get_stats('client_layers/layers.15_out')
+        )
+        # self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
 
-        self.fc1 = IntegerLinear(self.params['client_layers/layers.1_folded'], 
-                                 input_stats={'act_min': -0.5, 'act_max': 3.0})
-        self.fc2 = IntegerLinear(self.params['client_layers/layers.5_folded'], input_stats=self.RELU_STATS)
-        self.fc3 = IntegerLinear(self.params['client_layers/layers.9_folded'], input_stats=self.RELU_STATS)
-        self.fc4 = IntegerLinear(self.params['client_layers/layers.13_folded'], input_stats=self.RELU_STATS)
-        self.fc5 = IntegerLinear(self.params['client_layers/layers.17_folded'], input_stats=self.RELU_STATS)
+        # self.fc1 = IntegerLinear(self.params['client_layers/layers.1_folded'], 
+        #                          input_stats={'act_min': -0.5, 'act_max': 3.0})
+        # self.fc2 = IntegerLinear(self.params['client_layers/layers.5_folded'], input_stats=self.RELU_STATS)
+        # self.fc3 = IntegerLinear(self.params['client_layers/layers.9_folded'], input_stats=self.RELU_STATS)
+        # self.fc4 = IntegerLinear(self.params['client_layers/layers.13_folded'], input_stats=self.RELU_STATS)
+        # self.fc5 = IntegerLinear(self.params['client_layers/layers.17_folded'], input_stats=self.RELU_STATS)
 
     def forward(self, x):
         x = x.flatten(1)
@@ -158,44 +158,44 @@ class ServerInference(nn.Module):
     def __init__(self, server_params):
         super().__init__()
         self.params = server_params
-        # def get_stats(layer_key, default_min=0.0, default_max=6.0):
-        #     layer_data = server_params.get(layer_key, {})
-        #     return {
-        #         'act_min': layer_data.get('act_min', default_min),
-        #         'act_max': layer_data.get('act_max', default_max)
-        #     }
+        def get_stats(layer_key, default_min=0.0, default_max=6.0):
+            layer_data = server_params.get(layer_key, {})
+            return {
+                'act_min': layer_data.get('act_min', default_min),
+                'act_max': layer_data.get('act_max', default_max)
+            }
 
-        # # Server 第一层输入来自 Client，范围是 ReLU6 [0, 6]
-        # # 或者使用通信信道的量化范围
-        # self.fc1 = IntegerLinear(
-        #     self.params['server_layers/layers.0_folded'], 
-        #     input_stats={'act_min': 0.0, 'act_max': 6.0} 
-        # )
+        # Server 第一层输入来自 Client，范围是 ReLU6 [0, 6]
+        # 或者使用通信信道的量化范围
+        self.fc1 = IntegerLinear(
+            self.params['server_layers/layers.0_folded'], 
+            input_stats={'act_min': 0.0, 'act_max': 6.0} 
+        )
         
-        # self.fc2 = IntegerLinear(
-        #     self.params['server_layers/layers.4_folded'], 
-        #     input_stats=get_stats('server_layers/layers.2_out')
-        # )
-        # self.fc3 = IntegerLinear(
-        #     self.params['server_layers/layers.8_folded'], 
-        #     input_stats=get_stats('server_layers/layers.6_out')
-        # )
-        # self.fc4 = IntegerLinear(
-        #     self.params['server_layers/layers.12_folded'], 
-        #     input_stats=get_stats('server_layers/layers.10_out')
-        # )
-        # # 最后一层通常没有 ReLU，stats 可能不同
-        # self.fc5 = IntegerLinear(
-        #     self.params['server_layers/layers.15'], 
-        #     input_stats=get_stats('server_layers/layers.14_out', default_min=-10.0, default_max=10.0)
-        # )
-        self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
+        self.fc2 = IntegerLinear(
+            self.params['server_layers/layers.4_folded'], 
+            input_stats=get_stats('server_layers/layers.2_out')
+        )
+        self.fc3 = IntegerLinear(
+            self.params['server_layers/layers.8_folded'], 
+            input_stats=get_stats('server_layers/layers.6_out')
+        )
+        self.fc4 = IntegerLinear(
+            self.params['server_layers/layers.12_folded'], 
+            input_stats=get_stats('server_layers/layers.10_out')
+        )
+        # 最后一层通常没有 ReLU，stats 可能不同
+        self.fc5 = IntegerLinear(
+            self.params['server_layers/layers.15'], 
+            input_stats=get_stats('server_layers/layers.14_out', default_min=-10.0, default_max=10.0)
+        )
+        # self.RELU_STATS = {'act_min': 0.0, 'act_max': 6.0}
 
-        self.fc1 = IntegerLinear(self.params['server_layers/layers.0_folded'], input_stats=self.RELU_STATS)
-        self.fc2 = IntegerLinear(self.params['server_layers/layers.4_folded'], input_stats=self.RELU_STATS)
-        self.fc3 = IntegerLinear(self.params['server_layers/layers.8_folded'], input_stats=self.RELU_STATS)
-        self.fc4 = IntegerLinear(self.params['server_layers/layers.12_folded'], input_stats=self.RELU_STATS)
-        self.fc5 = IntegerLinear(self.params['server_layers/layers.15'], input_stats=self.RELU_STATS)
+        # self.fc1 = IntegerLinear(self.params['server_layers/layers.0_folded'], input_stats=self.RELU_STATS)
+        # self.fc2 = IntegerLinear(self.params['server_layers/layers.4_folded'], input_stats=self.RELU_STATS)
+        # self.fc3 = IntegerLinear(self.params['server_layers/layers.8_folded'], input_stats=self.RELU_STATS)
+        # self.fc4 = IntegerLinear(self.params['server_layers/layers.12_folded'], input_stats=self.RELU_STATS)
+        # self.fc5 = IntegerLinear(self.params['server_layers/layers.15'], input_stats=self.RELU_STATS)
 
     def forward(self, x):
         x = F.relu6(self.fc1(x))
@@ -252,7 +252,8 @@ def main():
             
             # Step 1: 量化转比特
             # 此时 client_output 是模拟 float，我们将其转为 bit stream
-            tx_bits, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+            # tx_bits, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+            tx_bits = Float32Codec.float_to_bits(client_output)
 
             # Step 2: 调制
             tx_symbols = modem.modulate(tx_bits)
@@ -263,9 +264,10 @@ def main():
             # Step 4: 解调
             rx_bits = modem.demodulate(rx_noisy)
             
-            # Step 5: 反量化
-            # 恢复成浮点数传给 Server (模拟解码后的数据)
-            server_input = Int8Codec.bits_to_float(rx_bits, scale, zp, num_bits=8)
+            # # Step 5: 反量化
+            # # 恢复成浮点数传给 Server (模拟解码后的数据)
+            # server_input = Int8Codec.bits_to_float(rx_bits, scale, zp, num_bits=8)
+            server_input = Float32Codec.bits_to_float(rx_bits)
 
             # 3. Server 推理
             final_output = server_model(server_input)

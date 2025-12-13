@@ -18,7 +18,7 @@ try:
 except ImportError:
     raise ImportError("请确保 quant_utils.py 在同一目录下")
 
-from split_comm_utils import BPSKModem, Int8Codec
+from split_comm_utils import BPSKModem, Int8Codec, Float32Codec
 # ==========================================
 # 1. 配置与超参数
 # ==========================================
@@ -128,8 +128,9 @@ def train_one_epoch(client_model, server_model, modem, train_loader,
         
         # 1. 量化 + 转比特 (Float -> Bits)
         # 此时 client_out 是 tensor，这里将其变成 bit stream
-        act_bits, act_scale, act_zp = Int8Codec.float_to_bits(client_out.detach(), act_min, act_max, num_bits=8)
-        
+        # act_bits, act_scale, act_zp = Int8Codec.float_to_bits(client_out.detach(), act_min, act_max, num_bits=8)
+        act_bits = Float32Codec.float_to_bits(client_out)
+
         # 2. 调制 (Bits -> Symbols)
         tx_symbols_act = modem.modulate(act_bits)
         
@@ -141,8 +142,9 @@ def train_one_epoch(client_model, server_model, modem, train_loader,
         
         # 5. 反量化 (Bits -> Float)
         # 这里的 server_input 已经是经过了一轮物理信道的数据了
-        server_input = Int8Codec.bits_to_float(rx_bits_act, act_scale, act_zp, num_bits=8)
-        
+        # server_input = Int8Codec.bits_to_float(rx_bits_act, act_scale, act_zp, num_bits=8)
+        server_input = Float32Codec.bits_to_float(rx_bits_act)
+
         # [关键] 允许梯度追踪，因为这是 Server 的输入叶子节点
         server_input.requires_grad_(True)
         
@@ -171,7 +173,8 @@ def train_one_epoch(client_model, server_model, modem, train_loader,
         grad_max = grad_server.max().item()
         
         # 1. 梯度量化 + 转比特
-        grad_bits, grad_scale, grad_zp = Int8Codec.float_to_bits(grad_server, grad_min, grad_max, num_bits=8)
+        # grad_bits, grad_scale, grad_zp = Int8Codec.float_to_bits(grad_server, grad_min, grad_max, num_bits=8)
+        grad_bits = Float32Codec.float_to_bits(grad_server)
         
         # 2. 梯度调制
         tx_symbols_grad = modem.modulate(grad_bits)
@@ -183,8 +186,9 @@ def train_one_epoch(client_model, server_model, modem, train_loader,
         rx_bits_grad = modem.demodulate(rx_noisy_symbols_grad)
         
         # 5. 梯度反量化
-        grad_client = Int8Codec.bits_to_float(rx_bits_grad, grad_scale, grad_zp, num_bits=8)
-        
+        # grad_client = Int8Codec.bits_to_float(rx_bits_grad, grad_scale, grad_zp, num_bits=8)
+        grad_client = Float32Codec.bits_to_float(rx_bits_grad)
+
         # ====================================================
         # Part 5: Client 反向传播
         # ====================================================
@@ -194,45 +198,6 @@ def train_one_epoch(client_model, server_model, modem, train_loader,
         if GRAD_CLIP_NORM is not None:
             torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=GRAD_CLIP_NORM)
         opt_client.step()
-        # # --- Step 1: Client Forward ---
-        # client_out = client_model(data)
-        
-        # # --- Step 2: Interface Quantization ---
-        # cut_layer_key = "client/layers.19_out"
-        # # 默认最小值改为 0.0，因为上一层是 ReLU6
-        # act_min, act_max = get_activation_range(cut_layer_key, 0.0, 6.0)
-        
-        # # 模拟量化传输(其实是输出层伪量化)
-        # client_out_q = ActQuantization(client_out, FloatMax=act_max, FloatMin=act_min)
-        
-        # # --- Step 3: Send to Server ---
-        # server_input = client_out_q.detach().clone()
-        # server_input.requires_grad_(True)
-        
-        # # --- Step 4: Server Forward ---
-        # server_out = server_model(server_input)
-        # loss = criterion(server_out, target)
-        
-        # # --- Step 5: Server Backward ---
-        # loss.backward()
-        
-        # # [新增] Server 端梯度裁剪 (在 optimizer.step 之前)
-        # if GRAD_CLIP_NORM is not None:
-        #     torch.nn.utils.clip_grad_norm_(server_model.parameters(), max_norm=GRAD_CLIP_NORM)
-        
-        # # --- Step 6: Return Gradient ---
-        # server_grad = server_input.grad.clone()
-        
-        # # --- Step 7: Client Backward ---
-        # client_out.backward(server_grad)
-        
-        # # [新增] Client 端梯度裁剪 (在 optimizer.step 之前)
-        # if GRAD_CLIP_NORM is not None:
-        #     torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=GRAD_CLIP_NORM)
-
-        # #更新参数    
-        # opt_server.step()
-        # opt_client.step()
         
         # 统计
         running_loss += loss.item() * data.size(0)
@@ -270,12 +235,13 @@ def evaluate(client_model, server_model, modem, dataloader, criterion):
             
             # [Step A] 源编码: Float -> Int8 -> Bits
             # 注意: 这里 num_bits=8 与 modem 无关，是量化精度
-            tx_bits, scale, zp = Int8Codec.float_to_bits(
-                client_out, 
-                act_min, 
-                act_max, 
-                num_bits=8
-            )
+            # tx_bits, scale, zp = Int8Codec.float_to_bits(
+            #     client_out, 
+            #     act_min, 
+            #     act_max, 
+            #     num_bits=8
+            # )
+            tx_bits = Float32Codec.float_to_bits(client_out)
             
             # [Step B] 调制: Bits -> Symbols
             tx_symbols = modem.modulate(tx_bits)
@@ -288,12 +254,13 @@ def evaluate(client_model, server_model, modem, dataloader, criterion):
             rx_bits = modem.demodulate(rx_noisy_symbols)
             
             # [Step E] 信源解码: Bits -> Int8 -> Float
-            server_input = Int8Codec.bits_to_float(
-                rx_bits, 
-                scale, 
-                zp, 
-                num_bits=8
-            )
+            # server_input = Int8Codec.bits_to_float(
+            #     rx_bits, 
+            #     scale, 
+            #     zp, 
+            #     num_bits=8
+            # )
+            server_input = Float32Codec.bits_to_float(rx_bits)
             
             # --- 4. 服务器端前向传播 ---
             # 使用解调并反量化后的数据作为输入
@@ -305,21 +272,6 @@ def evaluate(client_model, server_model, modem, dataloader, criterion):
             preds = server_out.argmax(dim=1)
             correct += preds.eq(target).sum().item()
             total += data.size(0)
-        
-            # client_out = client_model(data)
-            
-            # # 推理时同样使用 0.0 作为默认最小值
-            # cut_layer_key = "client_layers/layers.19_out"
-            # act_min, act_max = get_activation_range(cut_layer_key, 0.0, 6.0)
-            # client_out = ActQuantization(client_out, FloatMax=act_max, FloatMin=act_min)
-            
-            # server_out = server_model(client_out)
-            
-            # loss = criterion(server_out, target)
-            # running_loss += loss.item() * data.size(0)
-            # preds = server_out.argmax(dim=1)
-            # correct += preds.eq(target).sum().item()
-            # total += data.size(0)
             
     return running_loss / total, 100. * correct / total
 

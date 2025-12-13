@@ -78,24 +78,6 @@ class Int8Codec:
         bits = ((x_expand & mask_expand) != 0).float()
         
         return bits, scale, zp
-    # def float_to_bits(x_float, min_val, max_val, num_bits=8):
-    #     """
-    #     量化并转换为比特流
-    #     Return: (bits_tensor, scale, zero_point)
-    #     """
-    #     qmax = 2**num_bits - 1
-    #     scale = (max_val - min_val) / (qmax + 1e-12)
-    #     zp = round(-min_val / (scale + 1e-12))
-        
-    #     # 1. Float -> Int
-    #     x_int = (x_float / (scale + 1e-12) + zp).round().clamp(0, qmax).long()
-        
-    #     # 2. Int -> Bits
-    #     mask = 2 ** torch.arange(num_bits - 1, -1, -1).to(x_float.device)
-    #     x_expand = x_int.unsqueeze(-1)
-    #     bits = ((x_expand & mask) != 0).float()
-        
-    #     return bits, scale, zp
     
     @staticmethod
     def bits_to_float(bits, scale, zp, num_bits=8):
@@ -113,14 +95,70 @@ class Int8Codec:
         x_float = (x_int - zp) * scale
         
         return x_float
-    # def bits_to_float(bits, scale, zp, num_bits=8):
-    #     """
-    #     比特流反量化为浮点
-    #     """
-    #     # 1. Bits -> Int
-    #     mask = 2 ** torch.arange(num_bits - 1, -1, -1).to(bits.device, dtype=torch.float)
-    #     x_int = (bits * mask).sum(dim=-1).long()
+    
+# ==========================================
+# 3. Float32 直接编解码器 (Debug专用)
+# ==========================================
+class Float32Codec:
+    """
+    不进行量化，直接将 Float32 的 IEEE 754 内存位模式转换为 32 位比特流。
+    优点：无量化误差，无需统计 min/max。
+    缺点：通信开销大 (32 bits per pixel vs 8 bits)。
+    """
+    
+    @staticmethod
+    def get_bit_mask(device):
+        # 生成 32 位的掩码: [2^31, 2^30, ..., 2^0]
+        # 注意使用 int64 (long) 以避免溢出
+        powers = torch.arange(31, -1, -1, device=device)
+        mask = (2 ** powers).long()
+        return mask
+
+    @staticmethod
+    def float_to_bits(x_float):
+        """
+        Float32 -> 32 Bits
+        Return: bits (形状为 [..., 32])
+        """
+        # 1. 使用 view 将 float32 视为 int32 (保持位模式不变)
+        # 例如: 1.0 (float) -> 0x3f800000 (int)
+        # 注意：这里必须用 int32 来匹配 float32 的位宽
+        x_int32 = x_float.view(torch.int32)
         
-    #     # 2. Int -> Float
-    #     x_float = (x_int.float() - zp) * scale
-    #     return x_float
+        # 2. 为了方便位运算，转为 int64 (long) 处理，防止符号位干扰
+        # 这里的位运算是纯逻辑提取，不涉及数值意义
+        x_long = x_int32.long()
+        
+        # 3. 提取 32 个比特
+        mask = Float32Codec.get_bit_mask(x_float.device) # [32]
+        
+        # 扩展维度以便广播
+        x_expand = x_long.unsqueeze(-1) # [..., 1]
+        mask_expand = mask.unsqueeze(0) # [1, 32]
+        
+        # 按位与 -> 转为 0/1 float
+        # 注意处理负数存储时的补码/位表示，直接按位与即可
+        bits = ((x_expand & mask_expand) != 0).float()
+        
+        return bits
+
+    @staticmethod
+    def bits_to_float(bits):
+        """
+        32 Bits -> Float32
+        """
+        # 1. 获取掩码
+        mask = Float32Codec.get_bit_mask(bits.device) # [32]
+        
+        # 2. 加权求和恢复整数位模式
+        # bits: [..., 32], mask: [32]
+        # 结果可能很大，用 int64 承载
+        x_long_recon = (bits.long() * mask).sum(dim=-1)
+        
+        # 3. 转回 int32 (丢弃 int64 的高位，保留低32位)
+        x_int32_recon = x_long_recon.to(torch.int32)
+        
+        # 4. view 回 float32
+        x_float = x_int32_recon.view(torch.float32)
+        
+        return x_float

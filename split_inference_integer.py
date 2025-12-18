@@ -234,85 +234,107 @@ def main():
     client_model.eval()
     server_model.eval()
     
-    print(f"\n[True Integer Inference] Starting...")
+    print(f"\n[Parallel Integer Inference] Starting...")
     print("Mode: Int8 Weights, Int32 Accumulation")
+    print("Mode: 4-Carrier Parallel Transmission")
+
+    # ================= 配置区域 =================
+    NUM_CARRIERS = 4
+    # 可调整的功率分配 (例如: 增强高位所在的载波?)
+    # 这里的分配顺序对应: Carrier0(HighBits), Carrier1, ..., Carrier3(LowBits)
+    # POWER_PROFILE = [1.0, 1.0, 1.0, 1.0] 
+    POWER_PROFILE = [2.0, 1.2, 0.5, 0.3] # 示例：不均匀分配
+    # ===========================================
     
+    modem = BPSKModem(ebno_db=0.0, num_carriers=NUM_CARRIERS, power_profile=POWER_PROFILE)
     correct = 0
     total = 0
-    modem = BPSKModem(ebno_db=0.0) # 推理时 SNR 可能不同
+    
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
+            
             # 1. Client 推理
             client_output = client_model(images)
-           
-            # 2. 通信过程 (逐步调用)
-            # 定义范围 (ReLU6)
             val_min, val_max = 0.0, 6.0
             
-            # [Step 1: 生成各部分比特]
-            # A. 数据部分 (Batch, Dim, 8) -> 展平
+            # [Step 1: 生成比特流]
+            # Data: [Batch, Dim, 8]
             tx_bits_data, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
-            flat_data_bits = tx_bits_data.flatten() # 变为一维流
-            
-            # B. Scale 部分 (Float32 -> 32 bits)
-            # 使用 Float32Codec 处理，不损失精度
-            scale_tensor = torch.tensor([scale], device=device) # 包装成 tensor
-            scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten() # [32]
-            
-            # C. ZeroPoint 部分 (Int8 -> 8 bits)
-            # 使用我们新加的 Int8Codec.int_to_bits
+            # Scale: [32]
+            scale_tensor = torch.tensor([scale], device=device)
+            scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten()
+            # ZP: [8]
             zp_tensor = torch.tensor([zp], device=device)
-            zp_bits = Int8Codec.int_to_bits(zp_tensor, num_bits=8).flatten() # [8]
+            zp_bits = Int8Codec.int_to_bits(zp_tensor, num_bits=8).flatten()
+            
+            # [Step 2: 并行流映射 (Reshape & Permute)]
+            # 目标形状: [Time_Steps, 4]
+            
+            # A. 处理数据 (8 bits -> 4 carriers * 2 time_steps)
+            # 原始 bits 顺序是 MSB -> LSB (bit0, bit1, ... bit7)
+            # view(..., 4, 2) 将其分为: [b0,b1], [b2,b3], [b4,b5], [b6,b7]
+            # 对应载波: C0, C1, C2, C3
+            # 我们需要转置为 [2, 4] 以便时间维度在前
+            data_stream = tx_bits_data.view(-1, 4, 2).permute(0, 2, 1).reshape(-1, 4)
+            
+            # B. 处理 Scale (32 bits -> 4 carriers * 8 time_steps)
+            scale_stream = scale_bits.view(4, 8).t() # [8, 4]
+            
+            # C. 处理 ZP (8 bits -> 4 carriers * 2 time_steps)
+            zp_stream = zp_bits.view(4, 2).t() # [2, 4]
+            
+            # [Step 3: 拼接成完整的并行传输帧]
+            # 帧结构 (时间轴): [Data ... | Scale (8 steps) | ZP (2 steps)]
+            tx_frame = torch.cat([data_stream, scale_stream, zp_stream], dim=0)
 
-            # [Step 2: 打包 (Packing)]
-            # 完整比特流 = [数据比特] + [Scale比特] + [ZP比特]
-            tx_stream = torch.cat([flat_data_bits, scale_bits, zp_bits])
-
-            # [Step 3: 物理层传输]
-            tx_symbols = modem.modulate(tx_stream)
+            # [Step 4: 物理层传输]
+            tx_symbols = modem.modulate(tx_frame)
             rx_noisy = modem.add_noise(tx_symbols)
-            rx_stream = modem.demodulate(rx_noisy)
+            rx_frame = modem.demodulate(rx_noisy)
             
-            # [Step 4: 拆包 (Unpacking)]
-            # 计算切分点
-            len_data = flat_data_bits.numel()
-            len_scale = 32 # float32 固定 32位
-            len_zp = 8     # int8 固定 8位
+            # [Step 5: 拆包 (Slicing)]
+            len_data = data_stream.size(0)
+            len_scale = 8
+            len_zp = 2
             
-            # 切片
-            rx_data_bits_flat = rx_stream[:len_data]
-            rx_scale_bits = rx_stream[len_data : len_data + len_scale]
-            rx_zp_bits = rx_stream[len_data + len_scale :]
+            rx_data_stream = rx_frame[:len_data]
+            rx_scale_stream = rx_frame[len_data : len_data + len_scale]
+            rx_zp_stream = rx_frame[len_data + len_scale :]
             
-            # [Step 5: 恢复参数]
-            # 恢复 Scale (Bits -> Float32)
+            # [Step 6: 恢复数据结构]
+            # A. 恢复 Scale
+            # [8, 4] -> t() -> [4, 8] -> flatten -> [32]
+            rx_scale_bits = rx_scale_stream.t().flatten()
             rx_scale = Float32Codec.bits_to_float(rx_scale_bits).item()
             
-            # 恢复 ZP (Bits -> Int8)
+            # B. 恢复 ZP
+            # [2, 4] -> t() -> [4, 2] -> flatten -> [8]
+            rx_zp_bits = rx_zp_stream.t().flatten()
             rx_zp = Int8Codec.bits_to_int(rx_zp_bits).item()
             
-            # [Step 6: 恢复数据]
-            # 将展平的数据比特流 变回 (Batch, Dim, 8)
+            # C. 恢复 Data
+            # [Total_Time, 4] -> reshape(N*Dim, 2, 4) -> permute(0, 2, 1) -> [N*Dim, 4, 2] -> flatten -> [N, Dim, 8]
+            rx_data_bits_flat = rx_data_stream.view(-1, 2, 4).permute(0, 2, 1).flatten(1)
             rx_data_bits = rx_data_bits_flat.view_as(tx_bits_data)
             
-            # 反量化传给 Server (使用解码出来的 rx_scale 和 rx_zp)
+            # 反量化
             server_input = Int8Codec.bits_to_float(rx_data_bits, rx_scale, rx_zp, num_bits=8)
 
             # 3. Server 推理
             final_output = server_model(server_input)
             
-            # Stats
             preds = final_output.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
             
             if total == labels.size(0):
                  print(f"First Batch Preds: {preds[:5].tolist()}")
+                 print(f"DEBUG: PowerProfile={POWER_PROFILE}, Sent Scale={scale:.4f}, Rx Scale={rx_scale:.4f}")
 
     acc = 100.0 * correct / total
     print(f"\n========================================")
-    print(f"Final Integer Accuracy: {acc:.2f}%")
+    print(f"Final Accuracy (4-Carrier): {acc:.2f}%")
     print(f"========================================")
 
 if __name__ == "__main__":

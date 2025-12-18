@@ -1,32 +1,47 @@
 import torch
 
 # ==========================================
-# 1. 物理层调制解调器 (Modem)
+# 1. 物理层调制解调器 (Modem) - 支持并行载波
 # ==========================================
 class BPSKModem:
-    def __init__(self, ebno_db=20.0):
+    def __init__(self, ebno_db=20.0, num_carriers=4, power_profile=None):
         self.ebno_db = ebno_db
-        # BPSK: 0 -> +1, 1 -> -1
-        self.constellation = torch.tensor([1.0, -1.0])
-
-    def set_snr(self, ebno_db):
-        self.ebno_db = ebno_db
+        self.num_carriers = num_carriers
+        
+        # 功率分配 (Power Allocation)
+        # power_profile: list of length num_carriers, e.g., [1, 1, 1, 1]
+        if power_profile is None:
+            self.power_scale = torch.ones(num_carriers)
+        else:
+            assert len(power_profile) == num_carriers
+            # 归一化：保证平均能量为 1 (Total Energy = Num Carriers)
+            p_tensor = torch.tensor(power_profile, dtype=torch.float32)
+            avg_p = p_tensor.mean()
+            self.power_scale = torch.sqrt(p_tensor / avg_p) # 幅度缩放系数
 
     def modulate(self, bits):
         """
-        [发射] Bits (0/1) -> Symbols (+1/-1)
-        bits: [..., num_bits]
+        bits: [Time_Steps, Num_Carriers] (0/1)
+        Returns: symbols [Time_Steps, Num_Carriers] (+A/-A)
         """
-        # 0映射为+1, 1映射为-1
-        return 1.0 - 2.0 * bits.float()
+        # 0->+1, 1->-1
+        bpsk_syms = 1.0 - 2.0 * bits.float()
+        
+        # 应用功率分配 (Broadcast over time dimension)
+        # self.power_scale: [4] -> 广播到 [T, 4]
+        device = bits.device
+        scaled_syms = bpsk_syms * self.power_scale.to(device).unsqueeze(0)
+        
+        return scaled_syms
 
     def add_noise(self, symbols):
         """
-        [信道] AWGN 加噪
+        AWGN Channel
+        注意：噪声功率通常基于平均符号能量 Es=1 计算。
+        虽然各载波功率不同，但噪声水平通常假定为一致（白噪声）。
         """
-        # 计算噪声标准差
         snr_lin = 10 ** (self.ebno_db / 10.0)
-        # BPSK 符号能量Es=1, Sigma = sqrt(1 / (2*SNR))
+        # Sigma based on standard BPSK (Es=1)
         sigma = torch.sqrt(1.0 / (2.0 * torch.tensor(snr_lin)))
         
         noise = torch.randn_like(symbols) * sigma.to(symbols.device)
@@ -34,8 +49,8 @@ class BPSKModem:
 
     def demodulate(self, noisy_symbols):
         """
-        [接收] Symbols -> Bits (硬判决)
-        >0 -> 0, <=0 -> 1
+        硬判决: >0 -> 0, <=0 -> 1
+        功率缩放不改变符号，只改变抗噪能力，所以判决门限依然是 0
         """
         return (noisy_symbols <= 0).float()
 

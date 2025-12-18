@@ -230,7 +230,7 @@ def main():
     
     client_model = ClientInference(all_params['client']).to(device)
     server_model = ServerInference(all_params['server']).to(device)
-    
+
     client_model.eval()
     server_model.eval()
     
@@ -239,7 +239,7 @@ def main():
     
     correct = 0
     total = 0
-    modem = BPSKModem(ebno_db=20.0) # 推理时 SNR 可能不同
+    modem = BPSKModem(ebno_db=0.0) # 推理时 SNR 可能不同
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
@@ -250,35 +250,57 @@ def main():
             # 定义范围 (ReLU6)
             val_min, val_max = 0.0, 6.0
             
-            # Step 1: 量化转比特
-            # 此时 client_output 是模拟 float，我们将其转为 bit stream
-            # tx_bits, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
-            tx_bits = Float32Codec.float_to_bits(client_output)
+            # [Step 1: 生成各部分比特]
+            # A. 数据部分 (Batch, Dim, 8) -> 展平
+            tx_bits_data, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+            flat_data_bits = tx_bits_data.flatten() # 变为一维流
+            
+            # B. Scale 部分 (Float32 -> 32 bits)
+            # 使用 Float32Codec 处理，不损失精度
+            scale_tensor = torch.tensor([scale], device=device) # 包装成 tensor
+            scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten() # [32]
+            
+            # C. ZeroPoint 部分 (Int8 -> 8 bits)
+            # 使用我们新加的 Int8Codec.int_to_bits
+            zp_tensor = torch.tensor([zp], device=device)
+            zp_bits = Int8Codec.int_to_bits(zp_tensor, num_bits=8).flatten() # [8]
 
-            # Step 2: 调制
-            tx_symbols = modem.modulate(tx_bits)
+            # [Step 2: 打包 (Packing)]
+            # 完整比特流 = [数据比特] + [Scale比特] + [ZP比特]
+            tx_stream = torch.cat([flat_data_bits, scale_bits, zp_bits])
 
-            # Step 3: 加噪
+            # [Step 3: 物理层传输]
+            tx_symbols = modem.modulate(tx_stream)
             rx_noisy = modem.add_noise(tx_symbols)
+            rx_stream = modem.demodulate(rx_noisy)
             
-            # Step 4: 解调
-            rx_bits = modem.demodulate(rx_noisy)
+            # [Step 4: 拆包 (Unpacking)]
+            # 计算切分点
+            len_data = flat_data_bits.numel()
+            len_scale = 32 # float32 固定 32位
+            len_zp = 8     # int8 固定 8位
             
-            # # Step 5: 反量化
-            # # 恢复成浮点数传给 Server (模拟解码后的数据)
-            # server_input = Int8Codec.bits_to_float(rx_bits, scale, zp, num_bits=8)
-            server_input = Float32Codec.bits_to_float(rx_bits)
+            # 切片
+            rx_data_bits_flat = rx_stream[:len_data]
+            rx_scale_bits = rx_stream[len_data : len_data + len_scale]
+            rx_zp_bits = rx_stream[len_data + len_scale :]
+            
+            # [Step 5: 恢复参数]
+            # 恢复 Scale (Bits -> Float32)
+            rx_scale = Float32Codec.bits_to_float(rx_scale_bits).item()
+            
+            # 恢复 ZP (Bits -> Int8)
+            rx_zp = Int8Codec.bits_to_int(rx_zp_bits).item()
+            
+            # [Step 6: 恢复数据]
+            # 将展平的数据比特流 变回 (Batch, Dim, 8)
+            rx_data_bits = rx_data_bits_flat.view_as(tx_bits_data)
+            
+            # 反量化传给 Server (使用解码出来的 rx_scale 和 rx_zp)
+            server_input = Int8Codec.bits_to_float(rx_data_bits, rx_scale, rx_zp, num_bits=8)
 
             # 3. Server 推理
             final_output = server_model(server_input)
-            # # Client Part
-            # client_output = client_model(images)
-            
-            # # Transmission (Simulate)
-            # transmitted_data = client_output.detach().clone()
-            
-            # # Server Part
-            # final_output = server_model(transmitted_data)
             
             # Stats
             preds = final_output.argmax(dim=1)

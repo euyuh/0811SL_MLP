@@ -95,6 +95,46 @@ class Int8Codec:
         x_float = (x_int - zp) * scale
         
         return x_float
+    # 专门用于将整数 (如 ZeroPoint) 转为比特流
+    @staticmethod
+    def int_to_bits(x_int, num_bits=8):
+        """
+        Int -> Bits (不涉及量化，纯数值转二进制)
+        x_int: 整数 Tensor 或 Scalar
+        """
+        # 确保输入是 tensor
+        if not torch.is_tensor(x_int):
+            x_int = torch.tensor(x_int)
+        
+        device = x_int.device
+        # 转换为 Long 以进行位运算
+        x_long = x_int.long()
+        
+        # 获取掩码 [128, 64, ..., 1]
+        mask = Int8Codec.get_bit_mask(num_bits, device).long()
+        
+        # 处理维度: 如果是标量，增加维度以便广播
+        if x_long.dim() == 0:
+            x_long = x_long.view(1)
+            
+        x_expand = x_long.unsqueeze(-1) # [..., 1]
+        
+        # 提取比特
+        bits = ((x_expand & mask) != 0).float()
+        
+        # 如果输入是标量，返回 [8]；否则返回 [..., 8]
+        return bits.squeeze(0) if x_int.dim() == 0 else bits
+
+    # 专门用于将比特流恢复为整数
+    @staticmethod
+    def bits_to_int(bits, num_bits=8):
+        """
+        Bits -> Int
+        """
+        mask = Int8Codec.get_bit_mask(num_bits, bits.device)
+        # 加权求和
+        x_int = (bits * mask).sum(dim=-1)
+        return x_int.long()
     
 # ==========================================
 # 3. Float32 直接编解码器 (Debug专用)

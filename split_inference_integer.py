@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
+import matplotlib.pyplot as plt  # [新增] 绘图库
+import numpy as np               # [新增] 数值处理
+import random  # [新增] 用于生成随机索引
 from split_comm_utils import BPSKModem, Int8Codec, Float32Codec
 # ==========================================
 # 1. 纯整数运算核心 (True Integer Arithmetic)
@@ -236,31 +239,70 @@ def main():
     
     print(f"\n[Parallel Integer Inference] Starting...")
     print("Mode: Int8 Weights, Int32 Accumulation")
-    print("Mode: 4-Carrier Parallel Transmission")
+    print("Mode: 4-Carrier Parallel Transmission with BER Stats")
 
     # ================= 配置区域 =================
     NUM_CARRIERS = 4
     # 可调整的功率分配 (例如: 增强高位所在的载波?)
     # 这里的分配顺序对应: Carrier0(HighBits), Carrier1, ..., Carrier3(LowBits)
-    # POWER_PROFILE = [1.0, 1.0, 1.0, 1.0] 
-    POWER_PROFILE = [2.0, 1.2, 0.5, 0.3] # 示例：不均匀分配
+    POWER_PROFILE = [1.0, 1.0, 1.0, 1.0] #平均分配
+    # POWER_PROFILE = [1.3, 1.1, 0.9, 0.7] #轻度倾斜
+    # POWER_PROFILE = [1.6, 1.2, 0.8, 0.4] #中度倾斜
+    # POWER_PROFILE = [2.0, 1.2, 0.5, 0.3] #重度倾斜
+    # POWER_PROFILE = [2.5, 1.0, 0.4, 0.1] #极度倾斜
+    # POWER_PROFILE = [2.3, 1.3, 0.3, 0.1] #极度倾斜
+    #反向案例
+    # POWER_PROFILE = [0.7, 0.9, 1.1, 1.3] #轻度反向
+    # POWER_PROFILE = [0.4, 0.8, 1.2, 1.6] #中度反向
+    # POWER_PROFILE = [0.3, 0.5, 1.2, 2.0] #重度反向
+    # POWER_PROFILE = [0.1, 0.4, 1.0, 2.5] #极度反向
+    #其他变种
+    # POWER_PROFILE = [1.5, 0.5, 0.5, 1.5] #两头重中间轻
+    # POWER_PROFILE = [3.0, 0.33, 0.33, 0.34] #仅保护最高位
     # ===========================================
     
     modem = BPSKModem(ebno_db=0.0, num_carriers=NUM_CARRIERS, power_profile=POWER_PROFILE)
     correct = 0
     total = 0
+
+    # [修改点 1] 定义变量存储单个批次的数据
+    target_batch_idx = random.randint(0, len(test_loader) - 1)
+    print(f"Target Batch Index for Visualization: {target_batch_idx}")
     
+    pre_quant_data = None  # 存储量化前 (Float)
+    post_quant_data = None # 存储量化后 (Int8)
+
+    # BER 统计变量
+    # 记录每个通道的总误码数
+    total_channel_errors = torch.zeros(NUM_CARRIERS, device=device)
+    # 记录每个通道传输的总比特数 (所有通道传输比特数相同，存一个标量即可)
+    total_transmitted_bits_per_channel = 0
+
     with torch.no_grad():
-        for images, labels in test_loader:
+        # for images, labels in test_loader:
+        for batch_idx, (images, labels) in enumerate(test_loader):
             images, labels = images.to(device), labels.to(device)
             
             # 1. Client 推理
             client_output = client_model(images)
-            val_min, val_max = 0.0, 6.0
-            
+            val_min = client_output.min().item()
+            val_max = client_output.max().item()
+            # # ================= [修改点 2] 捕获目标批次数据 =================
+            # if batch_idx == target_batch_idx:
+            #     # A. 捕获量化前数据 (Float)
+            #     pre_quant_data = client_output.cpu().numpy().flatten()
+            # # =============================================================
+
             # [Step 1: 生成比特流]
             # Data: [Batch, Dim, 8]
             tx_bits_data, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+            # # ================= [修改点 3] 捕获量化后数据 =================
+            # if batch_idx == target_batch_idx:
+            #     # B. 捕获量化后数据 (Int8)
+            #     # 将比特流恢复为 0-255 的整数
+            #     int8_vals = Int8Codec.bits_to_int(tx_bits_data, num_bits=8)
+            #     post_quant_data = int8_vals.cpu().numpy().flatten()
+
             # Scale: [32]
             scale_tensor = torch.tensor([scale], device=device)
             scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten()
@@ -293,6 +335,14 @@ def main():
             rx_noisy = modem.add_noise(tx_symbols)
             rx_frame = modem.demodulate(rx_noisy)
             
+            # ================= [新增] BER 统计逻辑 =================
+            # tx_frame 和 rx_frame 形状均为 [Total_Time, 4]
+            # 比较发送和接收的比特，计算不相等的数量 (Sum over time dimension)
+            bit_errors = (tx_frame != rx_frame).sum(dim=0).float() # 结果形状 [4]
+            total_channel_errors += bit_errors
+            total_transmitted_bits_per_channel += tx_frame.size(0)
+            # ======================================================
+
             # [Step 5: 拆包 (Slicing)]
             len_data = data_stream.size(0)
             len_scale = 8
@@ -333,9 +383,64 @@ def main():
                  print(f"DEBUG: PowerProfile={POWER_PROFILE}, Sent Scale={scale:.4f}, Rx Scale={rx_scale:.4f}")
 
     acc = 100.0 * correct / total
+
+    # 计算各通道误比特率
+    channel_bers = (total_channel_errors / total_transmitted_bits_per_channel).cpu().numpy()
+
     print(f"\n========================================")
     print(f"Final Accuracy (4-Carrier): {acc:.2f}%")
+    print(f"Power Profile : {POWER_PROFILE}")
+    print(f"----------------------------------------")
+    print(f"Channel BER Stats (Carrier 0 -> 3):")
+    # Carrier 0 对应 High bits (MSB)，Carrier 3 对应 Low bits (LSB)
+    for i in range(NUM_CARRIERS):
+        role = "High Bits (MSB)" if i == 0 else ("Low Bits (LSB)" if i == 3 else "Mid Bits")
+        print(f"  Carrier {i} [{role}]: {channel_bers[i]:.4f} (Power: {POWER_PROFILE[i]})")
     print(f"========================================")
+
+    # # ================= [统计与绘图逻辑] =================
+    # # ================= [修改后] 绘图逻辑 (显示占比 Proportion) =================
+    # print("Generating comparison plots...")
+    
+    # if pre_quant_data is not None and post_quant_data is not None:
+    #     plt.figure(figsize=(14, 6))
+        
+    #     # 图1: 量化前 (Float)
+    #     plt.subplot(1, 2, 1)
+    #     # [修改核心] 使用 weights 将高度归一化为占比 (Proportion)
+    #     # 权重 = 1 / 总数，这样每个样本贡献 1/N 的高度，累加即为占比
+    #     weights_pre = np.ones_like(pre_quant_data) / len(pre_quant_data)
+        
+    #     # 去掉 density=True，改用 weights
+    #     plt.hist(pre_quant_data, bins=100, weights=weights_pre, color='skyblue', alpha=0.8)
+        
+    #     plt.title(f'Pre-Quantization Distribution (Float)\nBatch {target_batch_idx}')
+    #     plt.xlabel('Activation Value (Float)')
+    #     plt.ylabel('Proportion (0-1)') # 修改标签
+    #     plt.grid(True, alpha=0.3)
+    #     plt.text(0.95, 0.95, f"Range: [{pre_quant_data.min():.2f}, {pre_quant_data.max():.2f}]",
+    #              transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
+    #              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    #     # 图2: 量化后 (Int8)
+    #     plt.subplot(1, 2, 2)
+    #     # 同样计算权重
+    #     weights_post = np.ones_like(post_quant_data) / len(post_quant_data)
+        
+    #     plt.hist(post_quant_data, bins=256, range=(0, 255), weights=weights_post, color='salmon', alpha=0.8)
+        
+    #     plt.title(f'Post-Quantization Distribution (Int8)\nBatch {target_batch_idx}')
+    #     plt.xlabel('Quantized Value (0-255)')
+    #     plt.ylabel('Proportion (0-1)') # 修改标签
+    #     plt.grid(True, alpha=0.3)
+    #     plt.xlim(0, 255)
+        
+    #     save_path = 'pre_post_quant_comparison.png'
+    #     plt.savefig(save_path)
+    #     print(f"Comparison plot saved to: {os.path.abspath(save_path)}")
+    # else:
+    #     print("Error: Target batch data not captured.")
+    # =================================================
 
 if __name__ == "__main__":
     main()

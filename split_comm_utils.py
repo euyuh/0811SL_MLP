@@ -1,5 +1,8 @@
 import torch
-
+import numpy as np
+import math
+from MCS_Fun import llrs_computate # 学长的函数
+from CAPolarCodec import CAPolarCodec # 学长的类
 # ==========================================
 # 1. 物理层调制解调器 (Modem) - 支持并行载波
 # ==========================================
@@ -53,6 +56,351 @@ class BPSKModem:
         功率缩放不改变符号，只改变抗噪能力，所以判决门限依然是 0
         """
         return (noisy_symbols <= 0).float()
+
+# ==========================================
+# 2. QAM4 Modem (物理层)
+# ==========================================
+class QAM4Modem:
+    def __init__(self, snr_db=20.0, num_carriers=4, power_profile=None):
+        self.snr_db = snr_db
+        self.num_carriers = num_carriers
+        if power_profile is None:
+            self.power_scale = torch.ones(num_carriers)
+        else:
+            p_tensor = torch.tensor(power_profile, dtype=torch.float32)
+            self.power_scale = torch.sqrt(p_tensor / p_tensor.mean())
+
+    def modulate(self, bits):
+        """ bits: [Time, 4] -> 4-QAM (2 bits/symbol) -> [Time/2, 4] Complex """
+        T, C = bits.shape
+        # 补齐 Time 维度以防奇数
+        if T % 2 != 0:
+            bits = torch.cat([bits, torch.zeros(1, C, device=bits.device)], dim=0)
+            self.padded_mod = True
+        else:
+            self.padded_mod = False
+            
+        # 每2行合并: 行0->I路, 行1->Q路
+        bits_paired = bits.view(-1, 2, C).permute(0, 2, 1) # [Time/2, C, 2]
+        
+        # 0->+1, 1->-1. 归一化 / sqrt(2)
+        syms_I = 1.0 - 2.0 * bits_paired[..., 0].float()
+        syms_Q = 1.0 - 2.0 * bits_paired[..., 1].float()
+        complex_syms = torch.complex(syms_I, syms_Q) / 1.41421356 
+        
+        # 功率分配
+        return complex_syms * self.power_scale.to(bits.device).unsqueeze(0)
+
+    def add_noise(self, symbols):
+        # 物理层信噪比 Es/N0 = Eb/N0 (对于 QPSK/4QAM 且无额外重复时)
+        # 这里直接使用输入的 db 值作为符号信噪比
+        snr_lin = 10 ** (self.snr_db / 10.0)
+        sigma = torch.sqrt(1.0 / (2.0 * torch.tensor(snr_lin)))
+        noise_r = torch.randn_like(symbols.real) * sigma.to(symbols.device)
+        noise_i = torch.randn_like(symbols.imag) * sigma.to(symbols.device)
+        return symbols + torch.complex(noise_r, noise_i)
+
+# ==========================================
+# 3. Polar 适配器与流管理器 (核心新增)
+# ==========================================
+class PolarStreamAdapter:
+    """ 将长比特流切分为块，调用学长的 CAPolarCodec 进行处理 """
+    def __init__(self, N, K_info, crc_len, mod_ord=4):
+        self.N = N
+        self.K_info = K_info
+        # 实例化学长的类
+        # [修改 1] 调试阶段强制将 list_size 设为 1 (SC译码)，速度快 4-10 倍
+        # 等跑通了再改回 4
+        self.codec = CAPolarCodec(N=N, K_info=K_info, crc_len=crc_len, list_size=1) 
+        self.mod_ord = mod_ord
+        self.bits_per_sym = int(math.log2(mod_ord))
+
+    def encode_stream(self, bit_stream):
+        """ numpy 1D array -> encoded numpy 1D array """
+        total_len = len(bit_stream)
+        # Padding
+        pad_len = (self.K_info - (total_len % self.K_info)) % self.K_info
+        if pad_len > 0:
+            padded = np.concatenate([bit_stream, np.zeros(pad_len, dtype=int)])
+        else:
+            padded = bit_stream
+            
+        # 切块编码
+        num_blocks = len(padded) // self.K_info
+        reshaped = padded.reshape(num_blocks, self.K_info)
+        encoded_chunks = [self.codec.encode(blk) for blk in reshaped]
+        
+        return np.concatenate(encoded_chunks)
+
+    def decode_stream(self, rx_symbols_complex, snr_db, original_len):
+        """ 接收复数符号 -> LLR计算 -> 切块译码 -> 去Padding """
+        # 计算 LLR (注意: llrs_computate 需要的是 Eb/N0，我们做转换)
+        # Es/N0 = snr_db. Eb/N0 = Es/N0 - 10log10(BitsPerSym * Rate)
+        # 这里简单起见，直接传 snr_db 进 llrs_computate 的 ebn0 参数，
+        # 并把 code_rate 设为 1.0/bits_per_sym 抵消，使得函数内部计算出正确的 N0
+        # 或者直接计算 noise_power
+        
+        # 1. 计算实际码率 R
+        real_rate = self.K_info / self.N
+        
+        # 2. 计算每个符号的比特数 k (log2(M))
+        bits_per_sym = math.log2(self.mod_ord)
+        
+        # 3. [新增] 显式将 Es/N0 转换为 Eb/N0
+        # 公式: Eb/N0(dB) = Es/N0(dB) - 10*log10(Rate * k)
+        # 这里的 snr_db 实际上是 Es/N0
+        ebno_db = snr_db - 10 * math.log10(real_rate * bits_per_sym)
+        
+        # 4. 调用学长的函数 (传入正确的 Eb/N0)
+        llrs = llrs_computate(rx_symbols_complex, ebno_db, self.mod_ord, real_rate)
+        
+        # ================= [核心修改] =================
+        # 加上负号！翻转 LLR 的极性
+        llrs = -llrs 
+        # ============================================
+        
+        # 切块译码
+        num_blocks = len(llrs) // self.N
+        llrs_reshaped = llrs.reshape(num_blocks, self.N)
+        decoded_bits = []
+        # [修改 2] 增加 flush=True 确保立即显示进度
+        # [修改 3] 增加 Numba 编译提示
+        # print(f"  [Polar] Start decoding {num_blocks} blocks (First run may lag due to Numba compile)...")
+        for i, blk in enumerate(llrs_reshaped):
+            # 每解一个块打印一次，flush=True 强制刷新
+            print(f"    > Decoding block {i+1}/{num_blocks}...", end='\r', flush=True)
+            bits, crc = self.codec.decode(blk)
+            decoded_bits.append(bits)
+        print(" " * 50, end='\r') # 清除进度条
+        full_stream = np.concatenate(decoded_bits)
+        # for blk in llrs_reshaped:
+        #     bits, crc = self.codec.decode(blk)
+        #     decoded_bits.append(bits)
+            
+        # full_stream = np.concatenate(decoded_bits)
+        # 截取有效长度
+        return full_stream[:original_len]
+
+class MultiStreamManager:
+    """ 
+    负责：
+    1. 生成 Scale/ZP 的比特
+    2. 将数据切分为 4 个流 (Bit-Plane Slicing)
+    3. 将 Scale/ZP 复制 4 份附着在每个流头部
+    4. 调用 4 个 Adapter 进行编码
+    """
+    def __init__(self, device, N=512, K_info=256, crc_len=16):
+        self.device = device
+        # 4 个独立的编码器对应 4 个信道
+        self.adapters = [PolarStreamAdapter(N, K_info, crc_len) for _ in range(4)]
+
+    def pack_and_encode(self, data_bits_matrix, scale, zp):
+        """
+        data_bits_matrix: [Total_Pixels, 8]
+        scale, zp: float / int
+        Returns: tx_frame [Time, 4], info_lengths (list)
+        """
+        # 1. 准备 Metadata (Scale 32bit + ZP 8bit = 40 bits)
+        scale_bits = Float32Codec.float_to_bits(torch.tensor([scale], device=self.device)).flatten()
+        zp_bits = Int8Codec.int_to_bits(torch.tensor([zp], device=self.device), num_bits=8).flatten()
+        meta_bits = torch.cat([scale_bits, zp_bits]).cpu().numpy().astype(int)
+        
+        # 2. 横向切割数据流 (Bit-Plane Slicing)
+        # Stream 0 (Carrier 0): Col 0,1 (MSB)
+        # Stream 1 (Carrier 1): Col 2,3
+        # ...
+        streams = []
+        info_lengths = []
+        
+        for i in range(4):
+            # 提取两列 -> 展平
+            slice_data = data_bits_matrix[:, i*2 : (i+1)*2].flatten().cpu().numpy().astype(int)
+            # 头部附着 Metadata (复制 4 份的体现)
+            combined = np.concatenate([meta_bits, slice_data])
+            streams.append(combined)
+            info_lengths.append(len(combined))
+
+        # 3. 并行 Polar 编码
+        encoded_cols = []
+        max_len = 0
+        for i in range(4):
+            enc = self.adapters[i].encode_stream(streams[i])
+            encoded_cols.append(enc)
+            max_len = max(max_len, len(enc))
+            
+        # 4. 对齐并堆叠
+        # Polar是块编码，如果数据量一样，长度通常一样。防万一做个Padding
+        final_tensor_cols = []
+        for enc in encoded_cols:
+            if len(enc) < max_len:
+                enc = np.concatenate([enc, np.zeros(max_len - len(enc))])
+            final_tensor_cols.append(torch.from_numpy(enc).to(self.device).float())
+            
+        # [4, Time] -> [Time, 4]
+        tx_frame = torch.stack(final_tensor_cols, dim=0).t()
+        return tx_frame, info_lengths
+
+    def decode_and_unpack(self, rx_noisy_frame, info_lengths, snr_db):
+        """
+        Returns: data_bits_matrix [Total, 8], scale, zp
+        """
+        # rx_noisy_frame: [Time, 4] (Complex)
+        # 这里需要转回 CPU numpy 给 LLR 计算
+        rx_np = rx_noisy_frame.cpu().numpy()
+        
+        decoded_slices = []
+        meta_recovered = None
+        
+        # 1. 并行解码
+        for i in range(4):
+            # 取出第 i 列 (Carrier i)
+            # 注意：Modulation 输出了 Complex 符号，Modem 没有做硬判决
+            # 我们需要把 [Time, 4] 里的 Time 展开。
+            # QAM Modem 输入 N bits -> 输出 N/2 symbols
+            # 所以 rx_np 的长度是 encoded bits 的一半
+            
+            # 提取列 -> 复数数组
+            col_syms = rx_np[:, i] 
+            
+            # Polar 解码
+            # decode_stream 会处理 LLR 和去 Block Padding
+            full_bits = self.adapters[i].decode_stream(col_syms, snr_db, info_lengths[i])
+            
+            # 2. 剥离 Metadata (前40位)
+            meta_bits = full_bits[:40]
+            data_bits = full_bits[40:]
+            
+            # 只需要从 Carrier 0 (质量最好) 恢复 Metadata
+            if i == 0:
+                meta_recovered = torch.from_numpy(meta_bits).to(self.device)
+            
+            decoded_slices.append(torch.from_numpy(data_bits).to(self.device))
+            
+        # 3. 恢复 Metadata 数值
+        scale_bits = meta_recovered[:32]
+        zp_bits = meta_recovered[32:]
+        scale = Float32Codec.bits_to_float(scale_bits).item()
+        zp = Int8Codec.bits_to_int(zp_bits, num_bits=8).item()
+        
+        # 4. 恢复数据矩阵 [Total, 8]
+        # 每个 slice 是 [Total * 2] -> reshape [Total, 2]
+        # 然后横向拼接 [Total, 8]
+        num_pixels = decoded_slices[0].numel() // 2
+        reshaped_cols = [s.view(num_pixels, 2) for s in decoded_slices]
+        data_matrix = torch.cat(reshaped_cols, dim=1)
+        
+        return data_matrix, scale, zp
+    
+# # ==========================================
+# #  4-QAM Modem + 重复信道编码
+# # ==========================================
+# class QAM4Modem:
+#     def __init__(self, ebno_db=20.0, num_carriers=4, power_profile=None, code_repeat=4):
+#         """
+#         code_repeat: 信道编码重复次数。
+#                      Rate 1/4 意味着每个符号重复传 4 次 (1次数据 + 3次冗余)。
+#         """
+#         self.ebno_db = ebno_db
+#         self.num_carriers = num_carriers
+#         self.code_repeat = code_repeat  # 编码率分母，默认 4
+
+#         # 功率分配
+#         if power_profile is None:
+#             self.power_scale = torch.ones(num_carriers)
+#         else:
+#             assert len(power_profile) == num_carriers
+#             p_tensor = torch.tensor(power_profile, dtype=torch.float32)
+#             avg_p = p_tensor.mean()
+#             self.power_scale = torch.sqrt(p_tensor / avg_p)
+
+#     def modulate(self, bits):
+#         """
+#         输入 bits: [Total_Bits, Num_Carriers] (0/1)
+#         注意：4-QAM 需要每 2 个比特组成一个符号。
+#         假设输入的时间维度是成对的 (偶数长度)，第一行是 bit0 (I路)，第二行是 bit1 (Q路)。
+#         """
+#         device = bits.device
+        
+#         # 1. 检查输入长度
+#         T, C = bits.shape
+#         if T % 2 != 0:
+#             raise ValueError(f"4-QAM modulation requires even time steps, got {T}")
+            
+#         # 2. Reshape: 将时间维度的每2行合并 -> [T/2, 2, C]
+#         # permute -> [T/2, C, 2] (最后一维是 [I_bit, Q_bit])
+#         bits_paired = bits.view(T // 2, 2, C).permute(0, 2, 1)
+        
+#         # 3. 映射到 4-QAM 符号 (Gray Mapping 简化版)
+#         # 0 -> +1, 1 -> -1
+#         # Symbol = (1-2*bit_I) + j * (1-2*bit_Q)
+#         # 归一化: 除以 sqrt(2) 保证平均能量 Es=1 (未加功率分配前)
+#         syms_I = 1.0 - 2.0 * bits_paired[..., 0].float()
+#         syms_Q = 1.0 - 2.0 * bits_paired[..., 1].float()
+        
+#         complex_syms = torch.complex(syms_I, syms_Q) / 1.41421356 
+        
+#         # 4. 应用功率分配 (Broadcast over time)
+#         # self.power_scale: [C] -> 广播到 [T/2, C]
+#         scale = self.power_scale.to(device).unsqueeze(0)
+#         scaled_syms = complex_syms * scale
+        
+#         # 5. [信道编码] 重复编码 (Repetition Coding)
+#         # 在时间维度重复 repeat 次
+#         # [T/2, C] -> [T/2 * 4, C]
+#         coded_syms = scaled_syms.repeat_interleave(self.code_repeat, dim=0)
+        
+#         return coded_syms
+
+#     def add_noise(self, symbols):
+#         """
+#         添加复高斯白噪声 (CN)
+#         修改版：保持物理符号信噪比 (Es/N0) 不变。
+#         此时输入的 self.ebno_db 实际上代表 Es/N0 (dB)。
+#         """
+#         # [修改点] 不再乘以 bits_per_symbol 或 code_rate
+#         # 直接认为输入的 db 值就是物理信道上的符号信噪比 (SNR)
+#         snr_lin = 10 ** (self.ebno_db / 10.0)
+        
+#         # 复噪声功率 N0 = Es / SNR。假设符号能量 Es=1。
+#         # 实部虚部各分担一半噪声功率: sigma = sqrt(N0 / 2)
+#         # N0 = 1 / snr_lin
+#         sigma = torch.sqrt(1.0 / (2.0 * torch.tensor(snr_lin)))
+        
+#         # 生成复噪声
+#         noise_r = torch.randn_like(symbols.real) * sigma.to(symbols.device)
+#         noise_i = torch.randn_like(symbols.imag) * sigma.to(symbols.device)
+        
+#         return symbols + torch.complex(noise_r, noise_i)
+
+#     def demodulate(self, noisy_symbols):
+#         """
+#         接收 -> 软合并 (解码) -> 解调
+#         """
+#         # 1. [信道解码] 软合并 (Soft Combining)
+#         # 将重复传输的符号求平均
+#         # Input: [Total_Steps, C] -> [Original_Syms, Repeat, C]
+#         T_coded, C = noisy_symbols.shape
+#         T_syms = T_coded // self.code_repeat
+        
+#         # 维度变换: 分组 -> 求平均
+#         combined_syms = noisy_symbols.view(T_syms, self.code_repeat, C).mean(dim=1)
+        
+#         # 2. 4-QAM 解调 (Hard Decision)
+#         # I > 0 -> bit 0, I <= 0 -> bit 1
+#         # Q > 0 -> bit 0, Q <= 0 -> bit 1
+#         # 注意: 之前映射是 0->+1, 1->-1, 所以 >0 判决为 0
+        
+#         bits_I = (combined_syms.real <= 0).float()
+#         bits_Q = (combined_syms.imag <= 0).float()
+        
+#         # 3. 恢复比特流结构
+#         # [T_syms, C] -> [T_syms, C, 2] -> permute -> [T_syms, 2, C] -> reshape -> [T_syms*2, C]
+#         decoded_bits = torch.stack([bits_I, bits_Q], dim=2) # [T, C, 2]
+#         # 还原回 modulate 输入时的 [Time, Carriers] 形状
+#         # Time 维度变回原来的 2倍 (因为一个符号解出两个bit)
+#         output_bits = decoded_bits.permute(0, 2, 1).contiguous().view(-1, C)
+        
+#         return output_bits
 
 # ==========================================
 # 2. 信源编解码器 (Codec / Quantizer)

@@ -7,7 +7,8 @@ import os
 import matplotlib.pyplot as plt  # [新增] 绘图库
 import numpy as np               # [新增] 数值处理
 import random  # [新增] 用于生成随机索引
-from split_comm_utils import BPSKModem, Int8Codec, Float32Codec
+from split_comm_utils import QAM4Modem, Int8Codec, Float32Codec, MultiStreamManager
+# from split_comm_utils import QAM4Modem, Int8Codec, Float32Codec
 # ==========================================
 # 1. 纯整数运算核心 (True Integer Arithmetic)
 # ==========================================
@@ -74,7 +75,15 @@ class IntegerLinear(nn.Module):
         # [关键] 使用 torch.matmul 进行整数矩阵乘法
         # PyTorch 的 F.linear 对 int 输入支持有限，matmul 更通用
         # Input: [Batch, In], Weight.T: [In, Out] -> [Batch, Out]
-        acc_int = torch.matmul(x_shifted_int, w_int.t())
+        # acc_int = torch.matmul(x_shifted_int, w_int.t())
+        # [修改后] 兼容 GPU 的写法
+        if x_shifted_int.is_cuda:
+            # GPU: 转为 float 进行乘法 (模拟)，再转回 int
+            # 注意：对于 MNIST 这种小规模数据，float32 精度足够覆盖 int32 的累加范围
+            acc_int = torch.matmul(x_shifted_int.float(), w_int.float().t()).int()
+        else:
+            # CPU: 支持真正的 int32 乘法
+            acc_int = torch.matmul(x_shifted_int, w_int.t())
              
         # -------------------------------------------------------
         # Step 3: Dequantize (Int32 -> Float)
@@ -208,12 +217,151 @@ class ServerInference(nn.Module):
         x = self.fc5(x)
         return F.log_softmax(x, dim=1)
 
-# ==========================================
-# 4. 主程序
-# ==========================================
+# # ==========================================
+# # 4. 主程序
+# # ==========================================
+# def main():
+#     device = torch.device("cpu") # 整数运算通常在 CPU 模拟
+#     BATCH_SIZE = 128
+#     transform = transforms.Compose([
+#         transforms.Resize(64), transforms.CenterCrop(64),
+#         transforms.Grayscale(1), transforms.ToTensor(),
+#         transforms.Normalize([0.1307], [0.3081])
+#     ])
+#     test_ds = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
+#     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    
+#     export_file = "./current_export/split_model_quantized_8bit.pt"
+#     if not os.path.exists(export_file):
+#         print("错误：找不到量化参数文件。")
+#         return
+    
+#     print(f"Loading parameters from: {export_file}")
+#     # 强制 map_location 到 CPU，因为我们要进行 CPU 整数运算
+#     all_params = torch.load(export_file, map_location="cpu")
+    
+#     client_model = ClientInference(all_params['client']).to(device)
+#     server_model = ServerInference(all_params['server']).to(device)
+
+#     client_model.eval()
+#     server_model.eval()
+    
+#     print(f"\n[Parallel Integer Inference] Starting...")
+#     print("Mode: Int8 Weights, Int32 Accumulation")
+#     print("Mode: 4-Carrier Parallel Transmission (4-QAM)")
+#     print("Coding: Repetition Code (Rate 1/4) - 1 Symbol data + 3 Symbols redundancy")
+
+#     # ================= 配置区域 =================
+#     NUM_CARRIERS = 4
+#     # 可调整的功率分配 (例如: 增强高位所在的载波?)
+#     # 这里的分配顺序对应: Carrier0(HighBits), Carrier1, ..., Carrier3(LowBits)
+#     POWER_PROFILE = [2.6, 1.3, 0.1, 0.0]
+#     # ===========================================
+    
+#     modem = QAM4Modem(ebno_db=0.0, num_carriers=NUM_CARRIERS, 
+#                       power_profile=POWER_PROFILE, code_repeat=4)
+#     correct = 0
+#     total = 0
+
+#     # BER 统计变量
+#     # 记录每个通道的总误码数
+#     total_channel_errors = torch.zeros(NUM_CARRIERS, device=device)
+#     # 记录每个通道传输的总比特数 (所有通道传输比特数相同，存一个标量即可)
+#     total_transmitted_bits_per_channel = 0
+
+#     with torch.no_grad():
+#         for batch_idx, (images, labels) in enumerate(test_loader):
+#             images, labels = images.to(device), labels.to(device)
+            
+#             # 1. Client 推理
+#             client_output = client_model(images)
+#             val_min = client_output.min().item()
+#             val_max = client_output.max().item()
+
+#             # [Step 1: 生成比特流]
+#             tx_bits_data, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
+
+#             scale_tensor = torch.tensor([scale], device=device)
+#             scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten()
+#             zp_tensor = torch.tensor([zp], device=device)
+#             zp_bits = Int8Codec.int_to_bits(zp_tensor, num_bits=8).flatten()
+            
+#             # [Step 2: 并行流映射 (无需修改)]
+#             # 这里的 reshape 逻辑产生 [Time, 4] 的比特流
+#             # 第一行: [Bit0, Bit2, Bit4, Bit6] -> 作为 QAM 的 I 路
+#             # 第二行: [Bit1, Bit3, Bit5, Bit7] -> 作为 QAM 的 Q 路
+#             # QAM4Modem 会自动处理这种配对
+#             data_stream = tx_bits_data.view(-1, 4, 2).permute(0, 2, 1).reshape(-1, 4)
+#             scale_stream = scale_bits.view(4, 8).t()
+#             zp_stream = zp_bits.view(4, 2).t()
+            
+#             # [Step 3: 拼接成完整的并行传输帧]
+#             tx_frame = torch.cat([data_stream, scale_stream, zp_stream], dim=0)
+
+#             # [Step 4: 物理层传输 (包含 QAM + 编码)]
+#             # modulate 内部会将 tx_frame 的时间维度压缩一半(QAM)再扩展4倍(编码)
+#             tx_symbols = modem.modulate(tx_frame)
+#             rx_noisy = modem.add_noise(tx_symbols)
+#             # demodulate 内部会平均合并(解码)并解调，返回原本大小的比特流
+#             rx_frame = modem.demodulate(rx_noisy)
+            
+#             # [BER 统计]
+#             bit_errors = (tx_frame != rx_frame).sum(dim=0).float()
+#             total_channel_errors += bit_errors
+#             total_transmitted_bits_per_channel += tx_frame.size(0)
+
+#             # [Step 5: 拆包 (Slicing)]
+#             len_data = data_stream.size(0)
+#             len_scale = 8
+#             len_zp = 2
+            
+#             rx_data_stream = rx_frame[:len_data]
+#             rx_scale_stream = rx_frame[len_data : len_data + len_scale]
+#             rx_zp_stream = rx_frame[len_data + len_scale :]
+            
+#             # [Step 6: 恢复数据结构]
+#             rx_scale_bits = rx_scale_stream.t().flatten()
+#             rx_scale = Float32Codec.bits_to_float(rx_scale_bits).item()
+            
+#             rx_zp_bits = rx_zp_stream.t().flatten()
+#             rx_zp = Int8Codec.bits_to_int(rx_zp_bits).item()
+            
+#             rx_data_bits_flat = rx_data_stream.view(-1, 2, 4).permute(0, 2, 1).flatten(1)
+#             rx_data_bits = rx_data_bits_flat.view_as(tx_bits_data)
+            
+#             server_input = Int8Codec.bits_to_float(rx_data_bits, rx_scale, rx_zp, num_bits=8)
+
+#             # 3. Server 推理
+#             final_output = server_model(server_input)
+            
+#             preds = final_output.argmax(dim=1)
+#             correct += (preds == labels).sum().item()
+#             total += labels.size(0)
+            
+#             if batch_idx == 0:
+#                  print(f"First Batch Preds: {preds[:5].tolist()}")
+#                  print(f"DEBUG: PowerProfile={POWER_PROFILE}, Sent Scale={scale:.4f}, Rx Scale={rx_scale:.4f}")
+
+#     acc = 100.0 * correct / total
+#     channel_bers = (total_channel_errors / total_transmitted_bits_per_channel).cpu().numpy()
+
+#     print(f"\n========================================")
+#     print(f"Final Accuracy (4-Carrier 4-QAM + Repetition x4): {acc:.2f}%")
+#     print(f"Power Profile : {POWER_PROFILE}")
+#     print(f"----------------------------------------")
+#     print(f"Channel BER Stats (Carrier 0 -> 3):")
+#     for i in range(NUM_CARRIERS):
+#         role = "High Bits Pair" if i == 0 else "Low Bits Pair"
+#         print(f"  Carrier {i}: {channel_bers[i]:.4f}")
+#     print(f"========================================")
+
 def main():
-    device = torch.device("cpu") # 整数运算通常在 CPU 模拟
+    # device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
     BATCH_SIZE = 128
+    
+    # 数据加载
     transform = transforms.Compose([
         transforms.Resize(64), transforms.CenterCrop(64),
         transforms.Grayscale(1), transforms.ToTensor(),
@@ -222,225 +370,107 @@ def main():
     test_ds = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
     
+    # 加载模型
     export_file = "./current_export/split_model_quantized_8bit.pt"
     if not os.path.exists(export_file):
         print("错误：找不到量化参数文件。")
         return
+    # all_params = torch.load(export_file, map_location="cpu")
+    try:
+        # 尝试加载并直接映射到 GPU (或 CPU)
+        all_params = torch.load(export_file, map_location=device, weights_only=False)
+    except TypeError:
+        all_params = torch.load(export_file, map_location=device)
     
-    print(f"Loading parameters from: {export_file}")
-    # 强制 map_location 到 CPU，因为我们要进行 CPU 整数运算
-    all_params = torch.load(export_file, map_location="cpu")
-    
+    # 实例化模型
     client_model = ClientInference(all_params['client']).to(device)
     server_model = ServerInference(all_params['server']).to(device)
 
-    client_model.eval()
-    server_model.eval()
-    
-    print(f"\n[Parallel Integer Inference] Starting...")
-    print("Mode: Int8 Weights, Int32 Accumulation")
-    print("Mode: 4-Carrier Parallel Transmission with BER Stats")
-
     # ================= 配置区域 =================
-    NUM_CARRIERS = 4
-    # 可调整的功率分配 (例如: 增强高位所在的载波?)
-    # 这里的分配顺序对应: Carrier0(HighBits), Carrier1, ..., Carrier3(LowBits)
-    POWER_PROFILE = [1.0, 1.0, 1.0, 1.0] #平均分配
-    # POWER_PROFILE = [1.3, 1.1, 0.9, 0.7] #轻度倾斜
-    # POWER_PROFILE = [1.6, 1.2, 0.8, 0.4] #中度倾斜
-    # POWER_PROFILE = [2.0, 1.2, 0.5, 0.3] #重度倾斜
-    # POWER_PROFILE = [2.5, 1.0, 0.4, 0.1] #极度倾斜
-    # POWER_PROFILE = [2.3, 1.3, 0.3, 0.1] #极度倾斜
-    #反向案例
-    # POWER_PROFILE = [0.7, 0.9, 1.1, 1.3] #轻度反向
-    # POWER_PROFILE = [0.4, 0.8, 1.2, 1.6] #中度反向
-    # POWER_PROFILE = [0.3, 0.5, 1.2, 2.0] #重度反向
-    # POWER_PROFILE = [0.1, 0.4, 1.0, 2.5] #极度反向
-    #其他变种
-    # POWER_PROFILE = [1.5, 0.5, 0.5, 1.5] #两头重中间轻
-    # POWER_PROFILE = [3.0, 0.33, 0.33, 0.34] #仅保护最高位
-    # ===========================================
+    NUM_RUNS = 3    # 跑 5 次求平均
+    SNR_DB = 0.0    # 信噪比
     
-    modem = BPSKModem(ebno_db=0.0, num_carriers=NUM_CARRIERS, power_profile=POWER_PROFILE)
-    correct = 0
-    total = 0
-
-    # [修改点 1] 定义变量存储单个批次的数据
-    target_batch_idx = random.randint(0, len(test_loader) - 1)
-    print(f"Target Batch Index for Visualization: {target_batch_idx}")
+    # 功率分配: Carrier 0 功率最高 (保护 MSB)
+    # 对应: [MSB(7-6), Bits(5-4), Bits(3-2), LSB(1-0)]
+    POWER_PROFILE = [2.6, 1.3, 0.1, 0.0]
     
-    pre_quant_data = None  # 存储量化前 (Float)
-    post_quant_data = None # 存储量化后 (Int8)
-
-    # BER 统计变量
-    # 记录每个通道的总误码数
-    total_channel_errors = torch.zeros(NUM_CARRIERS, device=device)
-    # 记录每个通道传输的总比特数 (所有通道传输比特数相同，存一个标量即可)
-    total_transmitted_bits_per_channel = 0
-
-    with torch.no_grad():
-        # for images, labels in test_loader:
-        for batch_idx, (images, labels) in enumerate(test_loader):
-            images, labels = images.to(device), labels.to(device)
-            
-            # 1. Client 推理
-            client_output = client_model(images)
-            val_min = client_output.min().item()
-            val_max = client_output.max().item()
-            # # ================= [修改点 2] 捕获目标批次数据 =================
-            # if batch_idx == target_batch_idx:
-            #     # A. 捕获量化前数据 (Float)
-            #     pre_quant_data = client_output.cpu().numpy().flatten()
-            # # =============================================================
-
-            # [Step 1: 生成比特流]
-            # Data: [Batch, Dim, 8]
-            tx_bits_data, scale, zp = Int8Codec.float_to_bits(client_output, val_min, val_max, num_bits=8)
-            # # ================= [修改点 3] 捕获量化后数据 =================
-            # if batch_idx == target_batch_idx:
-            #     # B. 捕获量化后数据 (Int8)
-            #     # 将比特流恢复为 0-255 的整数
-            #     int8_vals = Int8Codec.bits_to_int(tx_bits_data, num_bits=8)
-            #     post_quant_data = int8_vals.cpu().numpy().flatten()
-
-            # Scale: [32]
-            scale_tensor = torch.tensor([scale], device=device)
-            scale_bits = Float32Codec.float_to_bits(scale_tensor).flatten()
-            # ZP: [8]
-            zp_tensor = torch.tensor([zp], device=device)
-            zp_bits = Int8Codec.int_to_bits(zp_tensor, num_bits=8).flatten()
-            
-            # [Step 2: 并行流映射 (Reshape & Permute)]
-            # 目标形状: [Time_Steps, 4]
-            
-            # A. 处理数据 (8 bits -> 4 carriers * 2 time_steps)
-            # 原始 bits 顺序是 MSB -> LSB (bit0, bit1, ... bit7)
-            # view(..., 4, 2) 将其分为: [b0,b1], [b2,b3], [b4,b5], [b6,b7]
-            # 对应载波: C0, C1, C2, C3
-            # 我们需要转置为 [2, 4] 以便时间维度在前
-            data_stream = tx_bits_data.view(-1, 4, 2).permute(0, 2, 1).reshape(-1, 4)
-            
-            # B. 处理 Scale (32 bits -> 4 carriers * 8 time_steps)
-            scale_stream = scale_bits.view(4, 8).t() # [8, 4]
-            
-            # C. 处理 ZP (8 bits -> 4 carriers * 2 time_steps)
-            zp_stream = zp_bits.view(4, 2).t() # [2, 4]
-            
-            # [Step 3: 拼接成完整的并行传输帧]
-            # 帧结构 (时间轴): [Data ... | Scale (8 steps) | ZP (2 steps)]
-            tx_frame = torch.cat([data_stream, scale_stream, zp_stream], dim=0)
-
-            # [Step 4: 物理层传输]
-            tx_symbols = modem.modulate(tx_frame)
-            rx_noisy = modem.add_noise(tx_symbols)
-            rx_frame = modem.demodulate(rx_noisy)
-            
-            # ================= [新增] BER 统计逻辑 =================
-            # tx_frame 和 rx_frame 形状均为 [Total_Time, 4]
-            # 比较发送和接收的比特，计算不相等的数量 (Sum over time dimension)
-            bit_errors = (tx_frame != rx_frame).sum(dim=0).float() # 结果形状 [4]
-            total_channel_errors += bit_errors
-            total_transmitted_bits_per_channel += tx_frame.size(0)
-            # ======================================================
-
-            # [Step 5: 拆包 (Slicing)]
-            len_data = data_stream.size(0)
-            len_scale = 8
-            len_zp = 2
-            
-            rx_data_stream = rx_frame[:len_data]
-            rx_scale_stream = rx_frame[len_data : len_data + len_scale]
-            rx_zp_stream = rx_frame[len_data + len_scale :]
-            
-            # [Step 6: 恢复数据结构]
-            # A. 恢复 Scale
-            # [8, 4] -> t() -> [4, 8] -> flatten -> [32]
-            rx_scale_bits = rx_scale_stream.t().flatten()
-            rx_scale = Float32Codec.bits_to_float(rx_scale_bits).item()
-            
-            # B. 恢复 ZP
-            # [2, 4] -> t() -> [4, 2] -> flatten -> [8]
-            rx_zp_bits = rx_zp_stream.t().flatten()
-            rx_zp = Int8Codec.bits_to_int(rx_zp_bits).item()
-            
-            # C. 恢复 Data
-            # [Total_Time, 4] -> reshape(N*Dim, 2, 4) -> permute(0, 2, 1) -> [N*Dim, 4, 2] -> flatten -> [N, Dim, 8]
-            rx_data_bits_flat = rx_data_stream.view(-1, 2, 4).permute(0, 2, 1).flatten(1)
-            rx_data_bits = rx_data_bits_flat.view_as(tx_bits_data)
-            
-            # 反量化
-            server_input = Int8Codec.bits_to_float(rx_data_bits, rx_scale, rx_zp, num_bits=8)
-
-            # 3. Server 推理
-            final_output = server_model(server_input)
-            
-            preds = final_output.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-            
-            if total == labels.size(0):
-                 print(f"First Batch Preds: {preds[:5].tolist()}")
-                 print(f"DEBUG: PowerProfile={POWER_PROFILE}, Sent Scale={scale:.4f}, Rx Scale={rx_scale:.4f}")
-
-    acc = 100.0 * correct / total
-
-    # 计算各通道误比特率
-    channel_bers = (total_channel_errors / total_transmitted_bits_per_channel).cpu().numpy()
-
-    print(f"\n========================================")
-    print(f"Final Accuracy (4-Carrier): {acc:.2f}%")
-    print(f"Power Profile : {POWER_PROFILE}")
-    print(f"----------------------------------------")
-    print(f"Channel BER Stats (Carrier 0 -> 3):")
-    # Carrier 0 对应 High bits (MSB)，Carrier 3 对应 Low bits (LSB)
-    for i in range(NUM_CARRIERS):
-        role = "High Bits (MSB)" if i == 0 else ("Low Bits (LSB)" if i == 3 else "Mid Bits")
-        print(f"  Carrier {i} [{role}]: {channel_bers[i]:.4f} (Power: {POWER_PROFILE[i]})")
-    print(f"========================================")
-
-    # # ================= [统计与绘图逻辑] =================
-    # # ================= [修改后] 绘图逻辑 (显示占比 Proportion) =================
-    # print("Generating comparison plots...")
+    # 初始化通信模块
+    # 注意: Polar 码后无需重复编码，QAM4Modem 只做调制
+    modem = QAM4Modem(snr_db=SNR_DB, num_carriers=4, power_profile=POWER_PROFILE)
     
-    # if pre_quant_data is not None and post_quant_data is not None:
-    #     plt.figure(figsize=(14, 6))
-        
-    #     # 图1: 量化前 (Float)
-    #     plt.subplot(1, 2, 1)
-    #     # [修改核心] 使用 weights 将高度归一化为占比 (Proportion)
-    #     # 权重 = 1 / 总数，这样每个样本贡献 1/N 的高度，累加即为占比
-    #     weights_pre = np.ones_like(pre_quant_data) / len(pre_quant_data)
-        
-    #     # 去掉 density=True，改用 weights
-    #     plt.hist(pre_quant_data, bins=100, weights=weights_pre, color='skyblue', alpha=0.8)
-        
-    #     plt.title(f'Pre-Quantization Distribution (Float)\nBatch {target_batch_idx}')
-    #     plt.xlabel('Activation Value (Float)')
-    #     plt.ylabel('Proportion (0-1)') # 修改标签
-    #     plt.grid(True, alpha=0.3)
-    #     plt.text(0.95, 0.95, f"Range: [{pre_quant_data.min():.2f}, {pre_quant_data.max():.2f}]",
-    #              transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
-    #              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    # 初始化流管理器 (N=512, K=256 代表 1/2 码率，可根据信道调整)
+    stream_manager = MultiStreamManager(device, N=512, K_info=256, crc_len=16)
 
-    #     # 图2: 量化后 (Int8)
-    #     plt.subplot(1, 2, 2)
-    #     # 同样计算权重
-    #     weights_post = np.ones_like(post_quant_data) / len(post_quant_data)
+    print(f"\n[System Config]")
+    print(f"  > Scheme: Bit-Plane Slicing + Polar Codes (N=512, K=256)")
+    print(f"  > Power Profile: {POWER_PROFILE} (Carrier 0 protects MSB)")
+    print(f"  > SNR: {SNR_DB} dB")
+    print(f"  > Runs: {NUM_RUNS} for averaging")
+    print("-" * 50)
+
+    acc_history = []
+
+    # === 5 次循环主逻辑 ===
+    for run_i in range(NUM_RUNS):
+        client_model.eval()
+        server_model.eval()
+        correct = 0
+        total = 0
         
-    #     plt.hist(post_quant_data, bins=256, range=(0, 255), weights=weights_post, color='salmon', alpha=0.8)
-        
-    #     plt.title(f'Post-Quantization Distribution (Int8)\nBatch {target_batch_idx}')
-    #     plt.xlabel('Quantized Value (0-255)')
-    #     plt.ylabel('Proportion (0-1)') # 修改标签
-    #     plt.grid(True, alpha=0.3)
-    #     plt.xlim(0, 255)
-        
-    #     save_path = 'pre_post_quant_comparison.png'
-    #     plt.savefig(save_path)
-    #     print(f"Comparison plot saved to: {os.path.abspath(save_path)}")
-    # else:
-    #     print("Error: Target batch data not captured.")
-    # =================================================
+        with torch.no_grad():
+            for batch_idx, (images, labels) in enumerate(test_loader):
+                images, labels = images.to(device), labels.to(device)
+                print(batch_idx)
+                # 1. Client 推理
+                client_out = client_model(images)
+                v_min, v_max = client_out.min().item(), client_out.max().item()
+                
+                # 2. 量化 (Float -> Bits)
+                # bits shape: [Batch, Dim, 8]
+                tx_bits_raw, scale, zp = Int8Codec.float_to_bits(client_out, v_min, v_max)
+                
+                # 展平为 [Total_Pixels, 8] 以便流管理器切割
+                bits_matrix = tx_bits_raw.view(-1, 8)
+
+                # [新增] 打印数据量
+                if batch_idx == 0:
+                    print(f"DEBUG: Batch Size: {BATCH_SIZE}")
+                    print(f"DEBUG: Client Output Shape: {client_out.shape}")
+                    print(f"DEBUG: Total Bits to Encode: {bits_matrix.numel()}")
+                    estimated_blocks = bits_matrix.numel() / (256 * 4) # 粗略估算
+                    print(f"DEBUG: Approx Polar Blocks to Decode: {int(estimated_blocks)}")
+                
+                # 3. 封装与编码 (Slice -> Add Scale/ZP -> Encode -> Stack)
+                # tx_frame: [Time, 4]
+                tx_frame, info_lens = stream_manager.pack_and_encode(bits_matrix, scale, zp)
+                
+                # 4. 信道传输
+                tx_syms = modem.modulate(tx_frame)
+                rx_noisy = modem.add_noise(tx_syms)
+                
+                # 5. 解码与重组 (Unstack -> Decode -> Extract Scale/ZP -> Merge)
+                rx_bits_matrix, rx_scale, rx_zp = stream_manager.decode_and_unpack(rx_noisy, info_lens, SNR_DB)
+                
+                # 6. 恢复形状与反量化
+                rx_bits_reshaped = rx_bits_matrix.view_as(tx_bits_raw)
+                server_in = Int8Codec.bits_to_float(rx_bits_reshaped, rx_scale, rx_zp)
+                
+                # 7. Server 推理
+                final_out = server_model(server_in)
+                pred = final_out.argmax(dim=1)
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
+                
+        acc = 100.0 * correct / total
+        acc_history.append(acc)
+        print(f"Run {run_i+1}: Accuracy = {acc:.2f}%")
+
+    # === 结果统计 ===
+    avg_acc = np.mean(acc_history)
+    print("=" * 30)
+    print(f"Final Average Accuracy: {avg_acc:.2f}%")
+    print(f"History: {acc_history}")
+    print("=" * 30)
 
 if __name__ == "__main__":
     main()
